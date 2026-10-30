@@ -1,6 +1,6 @@
 # panfrost-win: an open Mali GPU driver for Windows on Arm
 
-Status: plan v2, 2026-10-30. M0 and the hardware-free M3–M5 work landed, see [`docs/status/`](status/). The first board is now an Orange Pi Zero3 (Mali-G31, D6); the G610 work below is parked until an RK3588 board is available. Research behind every decision here is in [`docs/research/`](research/).
+Status: plan v2, 2026-10-30. M0 and the hardware-free M3–M5 work landed, see [`docs/status/`](status/). The first board is now an Orange Pi Zero3 (Mali-G31, D4); the G610 work below is parked until an RK3588 board is available. Research behind every decision here is in [`docs/research/`](research/).
 
 ## Goal
 
@@ -72,7 +72,7 @@ Why this shape:
 | WDDM 2.x (phase 2) | proper adapter, D3DKMT path, DXGI flip present, system GL ICD, D3D via a Gallium UMD |
 | DXVK / vkd3d-proton | blocked on panvk geometry + tessellation shaders (upstream work in progress) |
 
-### D6. First hardware target: Orange Pi Zero3 / Mali-G31 MP2 (Bifrost v7, job manager)
+### D4. First hardware target: Orange Pi Zero3 / Mali-G31 MP2 (Bifrost v7, job manager)
 
 Decided 2026-10-30: the board actually available is halal-beef's Orange Pi Zero3 (Allwinner H618,
 1.5 GB), which already runs Windows 11 ARM64 (≤ 23H2) on his Mu-Silicium UEFI with an SD-card
