@@ -1,3 +1,7 @@
 # SPDX-License-Identifier: MIT
 option('fake_kernel', type : 'boolean', value : false,
        description : 'Build the in-process fake panwin.sys transport (tests / no-hardware runs; enable at runtime with PANWIN_FAKE_KERNEL=1)')
+option('core_transport', type : 'boolean', value : false,
+       description : 'Link the real kmd/core + the host-test mock G610 into libdrm.dll as transport "core" (x86_64 test builds only: PANWIN_TRANSPORT=core, see include/panwin_core.h)')
+option('core_fw', type : 'string', value : '',
+       description : 'Default mali_csffw.bin for the core transport (Windows path; PANWIN_CORE_FW overrides). Empty: <repo>/../references/firmware/mali_csffw.bin via Z:')

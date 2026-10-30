@@ -38,4 +38,33 @@ int pw_syncobj_find_fence(struct pw_file *file, uint32_t handle, uint64_t point,
 int pw_syncobj_attach_fence(struct pw_file *file, uint32_t handle, uint64_t point,
 			    struct pw_fence *fence);
 
+/* ---- additions (core-sync) ---- */
+
+/* Upper bound on count_handles of SYNCOBJ_WAIT/TIMELINE_WAIT/RESET/SIGNAL/TIMELINE_SIGNAL/QUERY
+ * (Linux is only bounded by kmalloc); larger arrays fail with PW_EINVAL. */
+#define PW_SYNC_MAX_HANDLES (1u << 14)
+
+/*
+ * Object-level API, for callers that must not fail after the point of no return (panthor's
+ * GROUP_SUBMIT and VM_BIND resolve the syncobjs and preallocate the chain nodes up front, then
+ * call drm_syncobj_add_point()/drm_syncobj_replace_fence(), which cannot fail).
+ * lookup: a reference to the syncobj behind @handle, or NULL (Linux: drm_syncobj_find).
+ * point_alloc: preallocated timeline point (Linux: dma_fence_chain_alloc); NULL on ENOMEM.
+ * add_point: add (@point, @fence) to the timeline, consuming @pt (never fails); @point 0 or a
+ *   point <= the last one follows drm_syncobj_add_point() exactly (new chain context, seqno =
+ *   max(last, point)). The caller holds a reference on @so for the duration of the call.
+ * replace_fence: binary semantics, NULL resets (drm_syncobj_replace_fence).
+ * Waiters (SYNCOBJ_WAIT with WAIT_FOR_SUBMIT, notifies, find_fence) are woken by both.
+ */
+struct pw_syncobj;
+struct pw_syncobj_point;
+struct pw_syncobj *pw_syncobj_lookup(struct pw_file *file, uint32_t handle);
+struct pw_syncobj *pw_syncobj_get(struct pw_syncobj *so);
+void pw_syncobj_put(struct pw_syncobj *so);	/* NULL-safe */
+struct pw_syncobj_point *pw_syncobj_point_alloc(struct pw_device *dev);
+void pw_syncobj_point_free(struct pw_syncobj_point *pt);	/* unused preallocation; NULL-safe */
+void pw_syncobj_add_point(struct pw_syncobj *so, struct pw_syncobj_point *pt,
+			  struct pw_fence *fence, uint64_t point);
+void pw_syncobj_replace_fence(struct pw_syncobj *so, struct pw_fence *fence);
+
 #endif /* PW_SYNC_H */

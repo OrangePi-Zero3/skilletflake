@@ -7,9 +7,10 @@ pw_core_sources = files(
   'pw_fw.c',
   'pw_gpu.c',
   'pw_handle.c',
+  'pw_heap.c',
   'pw_irq.c',
   'pw_mmu.c',
-  'pw_sched_stub.c',
+  'pw_sched.c',
   'pw_sync.c',
   'pw_util.c',
 )

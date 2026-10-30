@@ -317,3 +317,30 @@ Independent review, 2026-10-30. I did not take the original report on trust.
      uptime and affects tests only.
 6. **Untested on hardware:** nothing was run against a real panwin.sys, and no ARM64 binary was
    executed.
+
+## M3-M5 update
+
+2026-10-30, key `glue`. The full report is in [glue.md](glue.md). The x86_64 build was tested
+under wine; nothing was run against a real panwin.sys.
+
+- **ABI v2:**
+  - Errors are decoded with `PANWIN_STATUS_TO_ERRNO`, so ETIME and ETIMEDOUT are now distinct
+    (resolves review concern 1).
+  - SYNCOBJ_EVENT creates the event in user mode and passes it in.
+  - `panwin_open` checks GET_INFO `abi_version == 2` (EPROTO otherwise;
+    `PANWIN_O_NOABICHECK` opts out).
+  - The timeout pass-through is documented and was checked against Mesa's QPC clock.
+- **Bug fix:** the device is now opened `FILE_FLAG_OVERLAPPED`, with a per-thread completion
+  event. A synchronous handle makes the I/O manager serialise all ioctls of the file object, so
+  a SYNCOBJ_WAIT in one thread would block the SIGNAL from another thread.
+- **Transports** are pluggable through the public `include/panwin_transport.h`:
+  - `panwin_register_transport` / `panwin_select_transport`;
+  - selection by `PANWIN_TRANSPORT=<name>|dll:<path>` (`PANWIN_FAKE_KERNEL=1` still works);
+  - a transport's `ioctl` returns the NTSTATUS.
+- **Fake kernel and tests:**
+  - The fake kernel is on ABI v2.
+  - Tests: `libdrm_fake` 198 checks, 0 failures; `ioctl_map` OK. The new checks cover a
+    transport DLL loaded through `dll:`.
+- **panwin-info:** adds `--transport`, and maps the user MMIO page to print LATEST_FLUSH_ID.
+- **Superseded:** "Requested contract changes" 1-3 and 6 are now in `panwin_ioctl.h`. Note
+  that 6 is inverted: the caller now creates the event.

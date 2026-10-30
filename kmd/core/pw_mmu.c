@@ -874,8 +874,11 @@ void pw_mmu_irq_handler(struct pw_device *dev, uint32_t status)
 
 		/* Faults aren't handled (no growable BOs): clear and let the job die. */
 		gpu_write(dev, MMU_INT_BASE + INT_CLEAR, mask);
-		if (vm)
+		if (vm) {
 			vm->unhandled_fault = true;
+			/* Sticky: user VMs report UNUSABLE from now on (pw_uvm_is_unusable). */
+			__atomic_add_fetch(&vm->fault_count, 1, __ATOMIC_RELEASE);
+		}
 
 		/* Disable the MMU to kill jobs on this AS. */
 		as_disable(dev, as, false);

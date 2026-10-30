@@ -404,3 +404,34 @@ source in `references/Windows-Driver-Frameworks`, Linux panthor/pmdomain/DT, Mes
    bring-up only.
 8. Already listed by the author: timer resolution, the missing MMAP/flush-ID/syncobj ioctls,
    signing tools, and the per-call temporary mapping for cache maintenance.
+
+## M3-M5 update
+
+2026-10-30, key `glue`. The full report is in [glue.md](glue.md). Nothing has run on hardware.
+
+- **New `pw_os.h` functions:**
+  - `pw_os_event_wait_user`: UserMode alertable `KeWaitForMultipleObjects` on the core event
+    plus the file's abort event; QPC deadline → relative timeout.
+  - `pw_os_copy_{from,to}_user`: ProbeFor* + memcpy under `__try`; the scope tables were checked
+    with the new `toolchain/scripts/seh_scopes.py`.
+  - `pw_os_work_*`: IO_WORKITEM + KTIMER/KDPC.
+  - `timer_hz` comes from CNTFRQ_EL0.
+- **Ioctls** are all executed and completed in `EvtIoInCallerContext`, with no sequential queue
+  any more, so a WAIT cannot deadlock a SIGNAL.
+  - Every DRM ioctl → `pw_file_ioctl`. Errors → `PANWIN_STATUS_FROM_ERRNO`.
+  - The glue's VERSION/GET_CAP/DEV_QUERY are gone (the core and `pw_core_stub.c` do them).
+  - GET_INFO and DEBUG_REG_READ are kept.
+  - MMAP/MUNMAP: partial MDL of the BO's pages, or an MDL over our MMIO mapping, mapped with
+    `MmMapLockedPagesSpecifyCache(UserMode)` + `MdlMappingNoWrite` for read-only.
+  - SYNCOBJ_EVENT: `ObReferenceObjectByHandle` on the caller's event.
+- **Files:** each has a `pw_file` with rundown protection. Cleanup and
+  `EvtDeviceD0ExitPreInterruptsDisabled` tear down waits, notifies and mappings, then call
+  `pw_file_close`.
+- **Superseded parts of this file:**
+  - The errno→NTSTATUS table: all failures are now the errno-carrying status.
+  - The "sequential queue" design.
+  - The DEV_QUERY/GET_CAP/VERSION notes: that logic now lives in the core and the stub.
+  - TODO 3 (missing MMAP/SYNCOBJ ioctls): done in the glue.
+- **Builds:** core=stub (57 KiB), core=real (108 KiB), and release+debug_ioctls build with 0
+  warnings, and `meson test` passes 2/2 in each.
+- **Imports:** 69 in total, all in the existing `.def`s, so no `.def` change was needed.

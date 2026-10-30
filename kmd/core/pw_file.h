@@ -37,6 +37,7 @@ void *pw_handle_replace(struct pw_handle_table *t, uint32_t handle, void *obj);
 /* ---- the file ---- */
 struct pw_sync_file;
 struct pw_sched_file;
+struct pw_bo_file;
 
 struct pw_file {
 	struct pw_device *dev;
@@ -46,6 +47,7 @@ struct pw_file {
 	struct pw_handle_table vms;	/* VM ids -> struct pw_uvm * (pw_bo.c) */
 	struct pw_sync_file *sync;	/* pw_sync.c */
 	struct pw_sched_file *sched;	/* pw_sched.c */
+	struct pw_bo_file *bo_file;	/* pw_bo.c: mmap-offset map, labels (added by core-mem) */
 
 	/* DRM_PANTHOR_SET_USER_MMIO_OFFSET; defaults to the 64-bit value. Both offsets are accepted
 	 * by pw_file_mmap_lookup() regardless (Mesa on Windows computes the 32-bit one). */

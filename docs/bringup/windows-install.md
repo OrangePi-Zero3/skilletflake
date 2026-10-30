@@ -192,7 +192,17 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filte
 3. Note the KMDF version (`Wdf01000.sys` → Properties → Details) and the Windows build (`winver`).
 4. Install the `core=stub` build (BootFirmware=0). Expected log, in order: `panwin.sys 0.1.0 ...`,
    `params: ...`, `irq 0 (job) ... irq 2 (gpu)`, `MMIO 0xfb000000+0x200000 mapped`, `PMU: ... -> GPU
-   on`, `core stub: GPU_ID 0xa867....`, `core device up`. Then run `tools/panwin-info` (GET_INFO,
-   DRM_IOCTL_VERSION, DEV_QUERY GPU_INFO; with `-Ddebug_ioctls=true` also raw register reads).
+   on`, `CNTFRQ_EL0 = 24000000 Hz`, `core stub: GPU_ID 0xa867....`, `core device up`. Then run
+   `tools/panwin-info` (GET_INFO with `abi_version 2`, DRM_IOCTL_VERSION `panthor 1.0.0`,
+   DEV_QUERY GPU_INFO, then `user MMIO page: LATEST_FLUSH_ID = 0x...` - the read-only user
+   mapping of GPU register page 0x10000 through PANWIN_IOCTL_MMAP; with `-Ddebug_ioctls=true` also
+   raw register reads, e.g. `--reg 0x10000` should print the same flush ID). CSIF_INFO fails with
+   ENOSYS on the stub (no firmware). [unverified] Extra ABI v2 checks worth doing here:
+   - the flush-ID page is really read-only: a write from user mode must raise an access
+     violation (relies on `MdlMappingNoWrite` being honoured for UserMode MDL mappings);
+   - closing panwin-info while it runs (Ctrl+C) leaves no mapping behind (Driver Verifier with
+     "pool tracking" + "I/O verification" on panwin.sys is the cheap way to catch leaks);
+   - `pnputil /disable-device` while a client has the device open: its ioctls must then fail
+     with ENODEV (file revoked in D0ExitPreInterruptsDisabled), no bugcheck.
 5. Install the `core=real` build with BootFirmware=0, then 1 (M2: firmware boot).
 6. Write down everything that differed from this guide in `docs/status/`.

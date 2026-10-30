@@ -12,38 +12,29 @@
 #define PW_RENDER_MINOR_BASE 128
 #define PW_PRIMARY_MINOR_BASE 0
 
-/*
- * A transport turns "device index i" into a kernel file and carries ioctls to it. The real one
- * uses SetupAPI + CreateFileW + NtDeviceIoControlFile; the fake one (tests) emulates panwin.sys
- * in-process. All entry points return 0 or a negative errno.
- */
-struct pw_transport {
-	const char *name;
-	/* Number of devices present (<= PW_MAX_DEVICES), or negative errno. */
-	int (*enumerate)(void);
-	/* Human-readable kernel path of device `index` (e.g. \\?\ACPI#RKCP7410#...), for diagnostics. */
-	int (*device_path)(int index, char *buf, size_t len);
-	int (*open)(int index, void **file);
-	void (*close)(void *file);
-	/* METHOD_BUFFERED semantics: `buf` holds in_size input bytes and receives up to out_size
-	 * output bytes; *returned = bytes written back. */
-	int (*ioctl)(void *file, uint32_t code, void *buf, uint32_t in_size, uint32_t out_size,
-		     uint32_t *returned);
-	/* Value returned by panwin_fd_to_handle(). */
-	void *(*os_handle)(void *file);
-};
+/* Transports: see include/panwin_transport.h (the public form of this table). */
+#include "panwin_transport.h"
 
-extern const struct pw_transport pw_transport_win32;
+extern const struct panwin_transport pw_transport_win32;
 #ifdef PANWIN_HAVE_FAKE_KERNEL
-extern const struct pw_transport pw_transport_fake;
+extern const struct panwin_transport pw_transport_fake;
+#endif
+#ifdef PANWIN_HAVE_CORE_TRANSPORT
+/* transport_core.c: the real kmd/core on the mock G610, in-process (test builds). */
+extern const struct panwin_transport pw_transport_core;
 #endif
 
-const struct pw_transport *pw_transport(void);
+/* The transport in use (selected at first use, see panwin_transport.h). */
+const struct panwin_transport *pw_transport(void);
+
+/* NTSTATUS returned by a transport ioctl -> 0 or a positive CRT errno. Success-class codes are
+ * success except STATUS_TIMEOUT (ETIME) and STATUS_USER_APC / STATUS_ALERTED (EINTR). */
+int pw_ioctl_status_to_errno(int32_t status);
 
 /* Emulated DRM file (shared by dup'ed fds and by mappings). */
 struct pw_file {
 	volatile long refs;
-	const struct pw_transport *tp;
+	const struct panwin_transport *tp;
 	void *tfile;
 	int index;      /* device index */
 };

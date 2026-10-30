@@ -564,6 +564,13 @@ int drmSyncobjEventfd(int fd, uint32_t handle, uint64_t point, int ev_fd, uint32
 	return no_fd_support(fd); /* use panwin_syncobj_event() instead */
 }
 
+/*
+ * Timeouts: like upstream libdrm, timeout_nsec is passed through unchanged. It is an ABSOLUTE
+ * deadline in nanoseconds on the QueryPerformanceCounter clock (panwin_ioctl.h), which is what
+ * Mesa's os_time_get_nano() returns on Windows, so Mesa's os_time_get_absolute_timeout() values
+ * work as on Linux (CLOCK_MONOTONIC there); INT64_MAX waits forever, 0 polls. The kernel ends an
+ * interrupted wait with EINTR and drmIoctl() restarts it with the same absolute deadline.
+ */
 int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
 		   unsigned flags, uint32_t *first_signaled)
 {

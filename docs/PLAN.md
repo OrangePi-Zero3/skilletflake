@@ -92,6 +92,20 @@ Hardware-free work (M0) can be verified here; everything from M1 needs an RK3588
 - **M7 — WDDM.** Render-only or render+display (own the UEFI framebuffer) WDDM 2.x driver,
   D3DKMT kmod backend, DXGI present, then a Gallium D3D UMD for D3D9-11/DWM.
 
+**Hardware-free status (2026-10-30).** The kernel-side code for M3–M5 is written and passes against
+the mock G610: BOs/VMs/VM_BIND (`pw_bo.c`), fences + binary/timeline syncobjs (`pw_sync.c`), the
+CSF scheduler with GROUP_SUBMIT and tiler heaps (`pw_sched.c`, `pw_heap.c`), the per-file ioctl
+dispatcher (`pw_file.c`, reports panthor DRM 1.6), and the Windows glue (MDL mmap, SYNCOBJ_EVENT,
+errno NTSTATUS). `tests/e2e/run.sh` runs unmodified Mesa panvk → libdrm-win → the real core + a mock
+command-stream executor under wine (x86_64): device creation, submit/fence, timeline semaphores,
+sparse binding, 1000-submit stress, zero leaks. Shader execution is not emulated, so no rendering
+results are checked. Per-piece detail and review findings: `docs/status/{core-mem,core-sync,
+core-sched,glue,e2e}.md`. Known gaps before multi-app use: no CSG slot rotation (the 17th live group
+waits forever), no GPU/FW reset, a timed-out CSG TERMINATE reuses the slot, MMU faults reach the
+scheduler late, one GPU fault makes a VM permanently unusable (stricter than panthor), async
+VM_BIND runs synchronously, DRM 1.7 (cached mappings) withheld until user-mode cache maintenance
+is checked on Windows ARM64.
+
 ## Repository layout
 
 ```
@@ -120,7 +134,10 @@ tools/                panwin-info and other bring-up tools
    Device; atomics on uncached memory may fault. Verify `MmNonCached` vs `MmWriteCombined` on HW.
 5. **panvk feature gaps** (GS/tess) cap GL and block DXVK — upstream work, outside our control.
 
-## Open contract decisions (from the M0 reviews)
+## Contract decisions (from the M0 reviews)
+
+Items 1–5 were settled and implemented in M3–M5 (`include/panwin/panwin_ioctl.h` ABI v2, `pw_os.h`).
+SYNCOBJ_EVENT takes a caller-created event handle.
 
 1. **IOCTL errors**: adopt `NTSTATUS = 0xE0000000 | (0xD52 << 16) | errno` for DRM ioctls, so the shim recovers
    the exact Linux errno (today ETIME and ETIMEDOUT collapse into one status). Needs kmd/win + libdrm-win changes.

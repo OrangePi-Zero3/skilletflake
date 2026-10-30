@@ -60,4 +60,18 @@ int  pw_uvm_activate(struct pw_uvm *uvm);
 /* Set when the GPU reported an unrecoverable fault on this VM (VM_GET_STATE -> UNUSABLE). */
 bool pw_uvm_is_unusable(struct pw_uvm *uvm);
 
+/* ---- additions (core-mem) ---- */
+
+/* pw_uvm_activate() also fails with PW_EINVAL once the VM is unusable (sticky). */
+
+/* BO_CREATE with an explicit set of accepted DRM_PANTHOR_BO_* flags. pw_ioctl_bo_create() passes
+ * the flags the emulated driver version allows (WB_MMAP needs >= 1.7); tests use this to
+ * exercise the WB_MMAP path regardless of the reported version. */
+int pw_bo_create_user(struct pw_file *file, struct drm_panthor_bo_create *args,
+		      uint32_t allowed_flags);
+/* True if user CPU mappings of @bo must be cacheable (WB_MMAP, or an IO-coherent GPU). */
+bool pw_bo_cpu_cached(struct pw_bo *bo);
+/* Kernel VA range of @uvm: [*start, *end). User binds are limited to [0, *start). */
+void pw_uvm_kernel_va_range(struct pw_uvm *uvm, uint64_t *start, uint64_t *end);
+
 #endif /* PW_BO_H */

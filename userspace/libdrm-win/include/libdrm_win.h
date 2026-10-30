@@ -21,6 +21,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "panwin_transport.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,7 +35,10 @@ extern "C" {
 #define PANWIN_DRM_MAJOR 226
 #define PANWIN_MAKEDEV(maj, min) ((((uint64_t)(maj) & 0xfffu) << 8) | ((uint64_t)(min) & 0xffu))
 
-/* flags for panwin_open: O_RDWR/O_CLOEXEC etc. are accepted and ignored. */
+/* flags for panwin_open: O_RDWR/O_CLOEXEC etc. are accepted and ignored. panwin_open checks
+ * the kernel's PANWIN_IOCTL_GET_INFO abi_version and fails with errno = EPROTO on a mismatch,
+ * unless PANWIN_O_NOABICHECK is set (diagnostic tools). */
+#define PANWIN_O_NOABICHECK 0x40000000
 int panwin_open(const char *path, int flags);
 int panwin_close(int fd);
 int panwin_dup(int fd);                  /* os_dupfd_cloexec() replacement */
@@ -54,7 +59,8 @@ int panwin_munmap(void *ptr, size_t size);
 int panwin_is_mapping(const void *ptr);  /* 1 if ptr is the start of a live panwin_mmap mapping */
 
 /* PANWIN_IOCTL_SYNCOBJ_EVENT: one-shot Win32 event (returned as void * = HANDLE, caller
- * CloseHandle()s it) signalled when syncobj `handle` reaches `point` (0 = binary). */
+ * CloseHandle()s it) signalled when syncobj `handle` reaches `point` (0 = binary). The event is
+ * a manual-reset event created here (ABI v2: the kernel references the caller's handle). */
 int panwin_syncobj_event(int fd, uint32_t handle, uint64_t point, uint32_t flags, void **event);
 
 /* Raw private-ioctl access (PANWIN_IOCTL_GET_INFO, DEBUG_REG_READ, ...): buf is in+out. */
@@ -66,15 +72,14 @@ int panwin_win32_error_to_errno(uint32_t err);
 
 /* Test hook: route all devices to the in-process fake kernel (only in builds configured with
  * -Dfake_kernel=true; otherwise returns -1/ENOSYS). Fails with EBUSY while any fd or mapping is
- * open. Also enabled at first use by the environment variable PANWIN_FAKE_KERNEL=1. */
+ * open. Same as panwin_select_transport(enable ? "fake" : "real"); also selected at first use
+ * by PANWIN_TRANSPORT=fake or the legacy PANWIN_FAKE_KERNEL=1. */
 int panwin_use_fake_kernel(int enable);
 
 /* Kernel-side (Win32) path of device `index` as UTF-8, e.g. \\?\ACPI#RKCP7410#..., for
  * diagnostics. Returns 0, or -1 with errno = ENOENT/EOVERFLOW. */
 int panwin_device_path(int index, char *buf, size_t len);
 
-/* "real" (DeviceIoControl) or "fake". */
-const char *panwin_transport_name(void);
 
 #ifdef __cplusplus
 }

@@ -40,6 +40,7 @@ struct pw_os; /* opaque, owned by the OS layer */
 #define PW_ETIME    -62
 #define PW_EOVERFLOW -75
 #define PW_ECANCELED -125
+#define PW_E2BIG     -7	/* added by core-mem: copy_struct_from_user()-style size checks, BO labels */
 
 /*
  * Execution context rules:
@@ -85,6 +86,10 @@ enum pw_mem_flags {
 	PW_MEM_CONTIGUOUS = 1u << 0, /* physically contiguous (page tables may want this) */
 	PW_MEM_KMAP       = 1u << 1, /* create a kernel CPU mapping (pw_os_mem_kva) */
 	PW_MEM_UNCACHED   = 1u << 2, /* CPU mapping is Normal non-cacheable / write-combined */
+	/* (added by core-mem) The pages must read as zero through every CPU mapping and from the
+	 * GPU on return (user BOs: no stale data may leak to userspace). kmd/win always zeroes
+	 * (MmAllocatePagesForMdlEx / RtlZeroMemory + clean), so it needs no change. */
+	PW_MEM_ZEROED     = 1u << 3,
 };
 
 struct pw_os_mem; /* opaque */

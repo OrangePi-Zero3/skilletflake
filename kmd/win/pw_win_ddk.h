@@ -37,9 +37,25 @@ NTKERNELAPI PVOID NTAPI MmAllocateContiguousNodeMemory(SIZE_T NumberOfBytes,
 						       PHYSICAL_ADDRESS BoundaryAddressMultiple,
 						       ULONG Protect, NODE_REQUIREMENT PreferredNode);
 
-/* MM_PAGE_PRIORITY modifiers (Windows 8+). */
+/* MM_PAGE_PRIORITY modifiers (Windows 8+). MdlMappingNoWrite makes the mapping read-only;
+ * per the MmMapLockedPagesSpecifyCache documentation it can be ORed into Priority (we rely on
+ * it for UserMode mappings too: UNTESTED ON HARDWARE, see docs/status/glue.md). */
 #ifndef MdlMappingNoExecute
 #define MdlMappingNoExecute 0x40000000
 #endif
+#ifndef MdlMappingNoWrite
+#define MdlMappingNoWrite 0x80000000
+#endif
+
+/*
+ * KeStackAttachProcess / KeUnstackDetachProcess (ntifs.h, absent from mingw's wdm/ntddk).
+ * KAPC_STATE is opaque to drivers; on 64-bit Windows it is 0x30 bytes (two LIST_ENTRYs, a
+ * process pointer and four flag bytes). Reserve 64 bytes, 8-byte aligned.
+ */
+typedef struct _PW_KAPC_STATE {
+	ULONG64 opaque[8];
+} PW_KAPC_STATE;
+NTKERNELAPI VOID NTAPI KeStackAttachProcess(PEPROCESS Process, PW_KAPC_STATE *ApcState);
+NTKERNELAPI VOID NTAPI KeUnstackDetachProcess(PW_KAPC_STATE *ApcState);
 
 #endif /* PW_WIN_DDK_H */

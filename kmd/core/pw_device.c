@@ -11,6 +11,7 @@
 
 #include "pw_mmu.h"
 #include "pw_priv.h"
+#include "pw_sched.h"
 
 int pw_device_alloc(const struct pw_device_params *params, struct pw_device **out)
 {
@@ -33,6 +34,9 @@ int pw_device_alloc(const struct pw_device_params *params, struct pw_device **ou
  * every line. Sync objects stay alive, since bottom halves may still be running. */
 static void device_quiesce(struct pw_device *dev)
 {
+	/* The OS layer closed every file first, so no group is left; the scheduler's work item
+	 * goes before the MCU (sched.c:4050 panthor_sched_unplug runs before panthor_fw_unplug). */
+	pw_sched_fini(dev);
 	pw_fw_fini(dev);
 	pw_mmu_fini(dev);
 	if (dev->gpu.reqs_lock && dev->gpu.l2_on)
@@ -74,6 +78,11 @@ static int device_probe(struct pw_device *dev)
 		return ret;
 
 	ret = pw_fw_init(dev);
+	if (ret)
+		return ret;
+
+	/* device.c:286: panthor_sched_init() right after panthor_fw_init(). */
+	ret = pw_sched_init(dev);
 	if (ret)
 		return ret;
 

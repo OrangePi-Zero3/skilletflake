@@ -13,6 +13,7 @@
 
 #include "pw_fw.h"
 #include "pw_mmu.h"
+#include "pw_sched.h"
 
 #define CSF_FW_NAME			"mali_csffw.bin"
 #define PW_FW_BOOT_TIMEOUT_MS		1000	/* fw.c:1140 */
@@ -648,6 +649,114 @@ void pw_fw_ring_csg_doorbells(struct pw_device *dev, uint32_t csg_mask)
 	pw_fw_ring_doorbell(dev, CSF_GLB_DOORBELL_ID);
 }
 
+/* ------------------------------------------------------------------------------------------ */
+/* MCU-VM kernel VA allocator (added by core-sched)                                           */
+/* ------------------------------------------------------------------------------------------ */
+
+struct pw_fw_kva {
+	struct pw_fw_kva *next;
+	uint32_t va;
+	uint32_t size;
+};
+
+/* [a, a+as) and [b, b+bs) intersect (64-bit math, no wrap-around for 32-bit inputs). */
+static bool kva_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
+{
+	return a < b + bs && b < a + as;
+}
+
+/*
+ * panthor_fw_alloc_queue_iface_mem()/panthor_fw_alloc_suspend_buf_mem() (fw.c:489-537) create
+ * kernel BOs with PANTHOR_VM_KERNEL_AUTO_VA on the MCU VM, whose kernel VA range is the shared
+ * region (fw.c:1525-1528); the FW sections placed in that range at load time are already
+ * allocated. First fit, page granular.
+ */
+int pw_fw_map_kernel_mem(struct pw_device *dev, struct pw_os_mem *mem, uint64_t size,
+			 uint32_t map_flags, uint32_t *mcu_va)
+{
+	const uint64_t start = CSF_MCU_SHARED_REGION_START;
+	const uint64_t end = CSF_MCU_SHARED_REGION_START + CSF_MCU_SHARED_REGION_SIZE;
+	struct pw_fw *fw = &dev->fw;
+	struct pw_fw_kva *node, **link;
+	uint64_t cand = start;
+	bool moved;
+	int ret;
+
+	*mcu_va = 0;
+	size = PW_ALIGN_UP(size, PW_SZ_4K);
+	if (!size || size > end - start || !fw->kva_lock)
+		return PW_EINVAL;
+	node = pw_os_zalloc(dev->os, sizeof(*node));
+	if (!node)
+		return PW_ENOMEM;
+
+	pw_os_mutex_lock(fw->kva_lock);
+	if (!fw->vm || !__atomic_load_n(&fw->ifaces_ready, __ATOMIC_ACQUIRE)) {
+		ret = PW_EINVAL;
+		goto err_unlock;
+	}
+	do {
+		moved = false;
+		for (uint32_t i = 0; i < fw->nsections; i++) {
+			const struct pw_fw_section *sec = &fw->sections[i];
+
+			if (kva_overlap(cand, size, sec->va, sec->size)) {
+				cand = PW_ALIGN_UP((uint64_t)sec->va + sec->size, PW_SZ_4K);
+				moved = true;
+			}
+		}
+		for (struct pw_fw_kva *n = fw->kva_list; n; n = n->next) {
+			if (kva_overlap(cand, size, n->va, n->size)) {
+				cand = (uint64_t)n->va + n->size;
+				moved = true;
+			}
+		}
+		if (cand + size > end) {
+			ret = PW_ENOMEM;
+			goto err_unlock;
+		}
+	} while (moved);
+
+	ret = pw_vm_map_mem(fw->vm, cand, mem, 0, size, map_flags);
+	if (ret)
+		goto err_unlock;
+	node->va = (uint32_t)cand;
+	node->size = (uint32_t)size;
+	for (link = &fw->kva_list; *link && (*link)->va < node->va; link = &(*link)->next)
+		;
+	node->next = *link;
+	*link = node;
+	pw_os_mutex_unlock(fw->kva_lock);
+	*mcu_va = (uint32_t)cand;
+	return PW_OK;
+
+err_unlock:
+	pw_os_mutex_unlock(fw->kva_lock);
+	pw_os_free(dev->os, node);
+	return ret;
+}
+
+void pw_fw_unmap_kernel_mem(struct pw_device *dev, uint32_t mcu_va)
+{
+	struct pw_fw *fw = &dev->fw;
+	struct pw_fw_kva *node = NULL, **link;
+
+	if (!fw->kva_lock || !mcu_va)
+		return;
+	pw_os_mutex_lock(fw->kva_lock);
+	for (link = &fw->kva_list; *link; link = &(*link)->next) {
+		if ((*link)->va == mcu_va) {
+			node = *link;
+			*link = node->next;
+			break;
+		}
+	}
+	if (node && fw->vm)
+		(void)pw_vm_unmap(fw->vm, node->va, node->size);
+	pw_os_mutex_unlock(fw->kva_lock);
+	pw_os_free(dev->os, node);
+}
+
 /* fw.c:1061-1096 */
 static void fw_init_global_iface(struct pw_device *dev)
 {
@@ -797,8 +906,9 @@ void pw_fw_job_irq_handler(struct pw_device *dev, uint32_t status)
 		if (evts)
 			pw_dbg(dev, "GLB events 0x%08x", evts);
 	}
+	/* fw.c:1112 panthor_sched_report_fw_events(): CSG bits go to the scheduler. */
 	if (status & ~JOB_INT_GLOBAL_IF)
-		pw_dbg(dev, "CSG IRQ 0x%08x ignored (no scheduler yet)", status & ~JOB_INT_GLOBAL_IF);
+		pw_sched_job_irq(dev, status & ~JOB_INT_GLOBAL_IF);
 }
 
 /* fw.c:1126-1165 */
@@ -869,7 +979,9 @@ int pw_fw_init(struct pw_device *dev)
 		fw->req_event = pw_os_event_create(dev->os);
 	if (!fw->req_lock)
 		fw->req_lock = pw_os_mutex_create(dev->os);
-	if (!fw->req_event || !fw->req_lock)
+	if (!fw->kva_lock)
+		fw->kva_lock = pw_os_mutex_create(dev->os);
+	if (!fw->req_event || !fw->req_lock || !fw->kva_lock)
 		return PW_ENOMEM;
 	fw->started = true;
 
@@ -933,6 +1045,18 @@ void pw_fw_fini(struct pw_device *dev)
 	pw_memset(fw->cs, 0, sizeof(fw->cs));
 	pw_os_mutex_unlock(fw->req_lock);
 
+	/* Kernel objects still mapped in the MCU VM would be a scheduler bug (groups are gone by
+	 * now); drop the bookkeeping, the mappings go with the VM. */
+	pw_os_mutex_lock(fw->kva_lock);
+	while (fw->kva_list) {
+		struct pw_fw_kva *n = fw->kva_list;
+
+		pw_err(dev, "fw: MCU kernel mapping 0x%08x+0x%x leaked", n->va, n->size);
+		fw->kva_list = n->next;
+		pw_os_free(dev->os, n);
+	}
+	pw_os_mutex_unlock(fw->kva_lock);
+
 	/* Tear down the MCU VM (AS0 disable, cache flush) before freeing what it maps. */
 	pw_vm_destroy(fw->vm);
 	fw->vm = NULL;
@@ -949,6 +1073,9 @@ void pw_fw_release(struct pw_device *dev)
 		pw_os_mutex_destroy(dev->os, fw->req_lock);
 	if (fw->req_event)
 		pw_os_event_destroy(dev->os, fw->req_event);
+	if (fw->kva_lock)
+		pw_os_mutex_destroy(dev->os, fw->kva_lock);
+	fw->kva_lock = NULL;
 	fw->req_lock = NULL;
 	fw->req_event = NULL;
 }

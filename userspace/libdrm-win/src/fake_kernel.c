@@ -11,9 +11,11 @@
  * by pagefile sections, the user flush-id page, VM_CREATE/VM_DESTROY, and the private GET_INFO,
  * SYNCOBJ_EVENT and DEBUG_REG_READ ioctls. There is no GPU: every fence is "signalled at submit".
  *
- * Errors are produced the way panwin.sys is proposed to report them: a positive Linux errno
- * wrapped in the customer NTSTATUS (see errno_map.c), then decoded by panwin_ntstatus_to_errno,
- * so the fake exercises the same decode path as the real transport.
+ * ABI v2 (include/panwin/panwin_ioctl.h): errors are returned the way panwin.sys reports them,
+ * PANWIN_STATUS_FROM_ERRNO(linux errno) as the request's NTSTATUS, and libdrm-win decodes them on
+ * the same path as for the real transport. SYNCOBJ_EVENT references the caller-created event
+ * (here: DuplicateHandle with EVENT_MODIFY_STATE, as ObReferenceObjectByHandle checks it).
+ * MUNMAP releases whole mappings only (user_va and size must match), like kmd/win.
  *
  * Timeouts are absolute nanoseconds on the QueryPerformanceCounter clock, which is what Mesa's
  * os_time_get_nano() returns on Windows (CLOCK_MONOTONIC on Linux).
@@ -34,6 +36,7 @@
 
 /* Linux errno numbers (what the OS-neutral core returns, see pw_os.h). */
 #define LX_ENOENT 2
+#define LX_EBADF 9
 #define LX_EFAULT 14
 #define LX_EBUSY 16
 #define LX_EINVAL 22
@@ -73,6 +76,7 @@ enum fk_map_kind { FK_MAP_VIEW, FK_MAP_FLUSH_ID };
 
 struct fk_map {
 	void *va;
+	uint64_t size;
 	enum fk_map_kind kind;
 };
 
@@ -572,7 +576,7 @@ static int fk_get_info(struct fk_file *f, void *arg)
 	return 0;
 }
 
-static int fk_map_add(struct fk_file *f, void *va, enum fk_map_kind kind)
+static int fk_map_add(struct fk_file *f, void *va, uint64_t size, enum fk_map_kind kind)
 {
 	if (f->nmaps == f->capmaps) {
 		uint32_t n = f->capmaps ? f->capmaps * 2 : 16;
@@ -583,6 +587,7 @@ static int fk_map_add(struct fk_file *f, void *va, enum fk_map_kind kind)
 		f->capmaps = n;
 	}
 	f->maps[f->nmaps].va = va;
+	f->maps[f->nmaps].size = size;
 	f->maps[f->nmaps].kind = kind;
 	f->nmaps++;
 	return 0;
@@ -604,7 +609,8 @@ static int fk_mmap(struct fk_file *f, void *arg)
 	void *va;
 	int r;
 
-	if (!m->prot || (m->prot & ~(PANWIN_PROT_READ | PANWIN_PROT_WRITE)) || (m->size & 4095) || !m->size)
+	if (!m->prot || (m->prot & ~(PANWIN_PROT_READ | PANWIN_PROT_WRITE)) || (m->size & 4095) ||
+	    !m->size || m->pad)
 		return -LX_EINVAL;
 
 	if (m->offset == mmio || m->offset == DRM_PANTHOR_USER_MMIO_OFFSET_32BIT ||
@@ -631,9 +637,9 @@ static int fk_mmap(struct fk_file *f, void *arg)
 			return -LX_ENOMEM;
 		kind = FK_MAP_VIEW;
 	}
-	r = fk_map_add(f, va, kind);
+	r = fk_map_add(f, va, m->size, kind);
 	if (r) {
-		struct fk_map tmp = { va, kind };
+		struct fk_map tmp = { va, m->size, kind };
 		fk_map_release(&tmp);
 		return r;
 	}
@@ -645,7 +651,7 @@ static int fk_munmap(struct fk_file *f, void *arg)
 {
 	struct panwin_munmap *m = arg;
 	for (uint32_t i = 0; i < f->nmaps; i++) {
-		if ((uint64_t)(uintptr_t)f->maps[i].va == m->user_va) {
+		if ((uint64_t)(uintptr_t)f->maps[i].va == m->user_va && f->maps[i].size == m->size) {
 			fk_map_release(&f->maps[i]);
 			f->maps[i] = f->maps[--f->nmaps];
 			return 0;
@@ -658,21 +664,22 @@ static int fk_syncobj_event(struct fk_file *f, void *arg)
 {
 	struct panwin_syncobj_event *a = arg;
 	struct fk_syncobj *s = so_get(f, a->handle);
-	if (!s)
-		return -LX_ENOENT;
-	HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
 	HANDLE mine;
-	if (!ev)
-		return -LX_ENOMEM;
-	/* The caller owns `ev`; we keep a duplicate to signal later. */
-	if (!DuplicateHandle(GetCurrentProcess(), ev, GetCurrentProcess(), &mine, 0, FALSE,
-			     DUPLICATE_SAME_ACCESS)) {
-		CloseHandle(ev);
-		return -LX_ENOMEM;
-	}
+
+	if (!s)
+		return -LX_EINVAL; /* drm_syncobj_find: no such syncobj */
+	if (a->flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE))
+		return -LX_EINVAL;
+	/* No GPU: "has a fence for point" == "point signalled". */
+	if (!so_reached(s, a->point) && !(a->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))
+		return -LX_EINVAL; /* no fence and not asked to wait for one */
+	/* The caller keeps its handle; we keep our own reference to the event object. */
+	if (!a->event_handle ||
+	    !DuplicateHandle(GetCurrentProcess(), (HANDLE)(uintptr_t)a->event_handle,
+			     GetCurrentProcess(), &mine, EVENT_MODIFY_STATE, FALSE, 0))
+		return -LX_EBADF;
 	struct fk_event *e = calloc(1, sizeof(*e));
 	if (!e) {
-		CloseHandle(ev);
 		CloseHandle(mine);
 		return -LX_ENOMEM;
 	}
@@ -681,7 +688,6 @@ static int fk_syncobj_event(struct fk_file *f, void *arg)
 	e->next = s->events;
 	s->events = e;
 	so_kick(s);
-	a->event_handle = (uint64_t)(uintptr_t)ev;
 	return 0;
 }
 
@@ -757,14 +763,14 @@ static const struct {
 	{ PANWIN_IOCTL_DEBUG_REG_READ, sizeof(struct panwin_debug_reg_read), fk_debug_reg_read },
 };
 
-static int lx_to_result(int lx)
+/* The NTSTATUS panwin.sys completes the request with (ABI v2). */
+static int32_t lx_to_result(int lx)
 {
-	/* Same path as a real NTSTATUS from panwin.sys: customer status carrying the Linux errno. */
-	return lx ? -panwin_ntstatus_to_errno((int32_t)(0xED520000u | (uint32_t)-lx)) : 0;
+	return lx ? PANWIN_STATUS_FROM_ERRNO(-lx) : 0;
 }
 
-static int fake_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size, uint32_t out_size,
-		      uint32_t *returned)
+static int32_t fake_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size,
+			  uint32_t out_size, uint32_t *returned)
 {
 	struct fk_file *f = file;
 	fk_handler fn = NULL;
@@ -793,6 +799,8 @@ static int fake_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size, ui
 			}
 		}
 	}
+	if (returned)
+		*returned = 0;
 	if (!fn)
 		return lx_to_result(-LX_ENOTTY);
 	/* METHOD_BUFFERED: input must hold the whole struct; output may be 0 (write-only). */
@@ -861,7 +869,8 @@ static void *fake_os_handle(void *file)
 	return file;
 }
 
-const struct pw_transport pw_transport_fake = {
+const struct panwin_transport pw_transport_fake = {
+	.version = PANWIN_TRANSPORT_VERSION,
 	.name = "fake",
 	.enumerate = fake_enumerate,
 	.device_path = fake_device_path,

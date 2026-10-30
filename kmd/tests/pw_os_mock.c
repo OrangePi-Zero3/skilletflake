@@ -12,6 +12,7 @@
  *  - MCU: MCU_CONTROL=AUTO checks the code/shared mappings through AS0, writes a global/CSG/CS
  *    interface into the shared section (through AS0) and raises JOB_INT GLOBAL_IF; doorbell 0
  *    echoes GLB req->ack and doorbell_req->doorbell_ack, raising GLOBAL_IF if ack_irq_mask says so.
+ *    CSG/CS requests and CS doorbells go to the command-stream executor in mock_csf.c.
  *  - Memory: fake PAs above 4 GiB, non-contiguous allocations get reversed, gapped PAs. Cached
  *    kernel mappings are a separate buffer: the GPU only sees what was pw_os_mem_flush()ed.
  */
@@ -24,8 +25,117 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <malloc.h>
+#include <windows.h>
+#endif
+
 #include "mock_gpu.h"
+#include "mock_internal.h"
 #include "pw_core.h"
+
+/*
+ * Portability (added by e2e): the mock is also built with x86_64-w64-mingw32 into libdrm-win's
+ * in-process "core" transport (tests/e2e). Linux keeps the original calls; on Windows:
+ *  - the pw_os_time_ns() clock is QueryPerformanceCounter-based, computed exactly like Mesa's
+ *    os_time_get_nano() (c11 timespec_get(TIME_MONOTONIC)), as panwin_ioctl.h requires;
+ *  - winpthreads ignores pthread_condattr_setclock() and measures absolute timeouts on the
+ *    realtime clock, so monotonic deadlines are turned into relative waits;
+ *  - aligned_alloc()/memmem() don't exist in the UCRT.
+ */
+static uint64_t mono_now_ns(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER f, c;
+	uint64_t sec;
+
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	sec = (uint64_t)(c.QuadPart / f.QuadPart);
+	return sec * 1000000000u +
+	       (uint64_t)(c.QuadPart - (int64_t)sec * f.QuadPart) * 1000000000u / (uint64_t)f.QuadPart;
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static void mono_cond_init(pthread_cond_t *c)
+{
+#ifdef _WIN32
+	pthread_cond_init(c, NULL);
+#else
+	pthread_condattr_t a;
+
+	pthread_condattr_init(&a);
+	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+	pthread_cond_init(c, &a);
+	pthread_condattr_destroy(&a);
+#endif
+}
+
+/* pthread_cond_timedwait() with an absolute CLOCK_MONOTONIC deadline (mono_now_ns() clock). */
+static int mono_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *ts)
+{
+#ifdef _WIN32
+	uint64_t deadline = (uint64_t)ts->tv_sec * 1000000000u + (uint64_t)ts->tv_nsec;
+	uint64_t now = mono_now_ns(), rel = deadline > now ? deadline - now : 0;
+	struct timespec r;
+
+	int ret;
+
+	if (!rel)
+		return ETIMEDOUT;
+	rel += 999999u;	/* winpthreads waits whole milliseconds: never wake up early */
+	if (rel > 3600000000000ull)
+		rel = 3600000000000ull;	/* far deadlines: wait in 1 h slices (no ms overflow) */
+	r.tv_sec = (time_t)(rel / 1000000000u);
+	r.tv_nsec = (long)(rel % 1000000000u);
+	ret = pthread_cond_timedwait_relative_np(c, m, &r);
+	/* Only report ETIMEDOUT once the monotonic deadline really passed; anything earlier is a
+	 * spurious wakeup the callers' predicate loops handle. */
+	if (ret == ETIMEDOUT && mono_now_ns() < deadline)
+		ret = 0;
+	return ret;
+#else
+	return pthread_cond_timedwait(c, m, ts);
+#endif
+}
+
+static void mono_timespec(struct timespec *ts)
+{
+#ifdef _WIN32
+	uint64_t ns = mono_now_ns();
+
+	ts->tv_sec = (time_t)(ns / 1000000000u);
+	ts->tv_nsec = (long)(ns % 1000000000u);
+#else
+	clock_gettime(CLOCK_MONOTONIC, ts);
+#endif
+}
+
+#ifdef _WIN32
+#define mock_page_alloc(size)	_aligned_malloc((size), 4096)
+#define mock_page_free(p)	_aligned_free(p)
+static void *mock_memmem(const void *h, size_t hl, const void *n, size_t nl)
+{
+	const char *p = h;
+
+	if (!nl)
+		return (void *)p;
+	for (size_t i = 0; i + nl <= hl; i++)
+		if (!memcmp(p + i, n, nl))
+			return (void *)(p + i);
+	return NULL;
+}
+#define memmem mock_memmem
+#else
+#define mock_page_alloc(size)	aligned_alloc(4096, (size))
+#define mock_page_free(p)	free(p)
+#endif
 
 #define REG_SPACE	0x200000u
 #define PW_MIN_U64(a, b) ((a) < (b) ? (a) : (b))
@@ -68,17 +178,7 @@
 #define D_XN		(1ull << 54)
 #define D_OA		0x0000fffffffff000ull
 
-/* Emulated interface layout inside the 64 KiB shared section at MCU VA 0x04000000. */
-#define SH_VA		0x04000000u
-#define SH_SIZE		0x10000u
-#define GLB_IN		0x100u
-#define GLB_OUT		0x200u
-#define CSG_CTRL(i)	(0x1000u + (i) * 0x100u)
-#define CS_CTRL(i, j)	(CSG_CTRL(i) + 0x40u + (j) * 0xcu)
-#define CSG_IN(i)	(0x3000u + (i) * 0x1000u)
-#define CSG_OUT(i)	(CSG_IN(i) + 0x80u)
-#define CS_IN(i, j)	(CSG_IN(i) + 0x100u + (j) * 0x180u)
-#define CS_OUT(i, j)	(CS_IN(i, j) + 0x80u)
+/* Shared-section interface layout: mock_internal.h. */
 
 struct pw_os_mutex {
 	pthread_mutex_t m;
@@ -97,7 +197,47 @@ struct pw_os_mem {
 	uint8_t *dram;		/* what the GPU sees */
 	uint8_t *cpu;		/* kernel mapping (== dram when uncached) */
 	uint64_t *pa;
+	uint8_t *user;		/* mock_mem_user_view() (e2e): == dram when uncached, else the
+				 * CPU-cache view shared with `cpu` (allocated on first use) */
+#ifdef _WIN32
+	HANDLE section;		/* dram is a view of this pagefile section, so user mappings
+				 * can be distinct views of the same pages (mock_mem_user_map) */
+#endif
 };
+
+/* "DRAM" backing store of a pw_os_mem (page aligned). */
+static uint8_t *dram_alloc(struct pw_os_mem *m, size_t size)
+{
+#ifdef _WIN32
+	void *p;
+
+	m->section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+					(DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+	if (!m->section)
+		return NULL;
+	p = MapViewOfFile(m->section, FILE_MAP_ALL_ACCESS, 0, 0, size);
+	if (!p) {
+		CloseHandle(m->section);
+		m->section = NULL;
+	}
+	return p;
+#else
+	(void)m;
+	return mock_page_alloc(size);
+#endif
+}
+
+static void dram_free(struct pw_os_mem *m)
+{
+#ifdef _WIN32
+	if (m->dram)
+		UnmapViewOfFile(m->dram);
+	if (m->section)
+		CloseHandle(m->section);
+#else
+	mock_page_free(m->dram);
+#endif
+}
 
 struct irq_thread {
 	struct pw_os *os;
@@ -145,12 +285,15 @@ struct pw_os {
 	void *fw_buf;
 
 	long allocs, mems, syncs;
+	struct mock_csf *csf;
 };
 
 static const uint32_t int_base[3] = { 0x1000, 0x2000, 0x20 };
+
+#define model_error mock_model_error
 static _Thread_local bool tls_in_irq_thread;
 
-static void model_error(struct pw_os *os, const char *fmt, ...)
+void mock_model_error(struct pw_os *os, const char *fmt, ...)
 {
 	va_list ap;
 
@@ -205,16 +348,17 @@ int pw_os_mem_alloc(struct pw_os *os, size_t size, uint32_t flags, struct pw_os_
 	m->size = size;
 	m->flags = flags;
 	m->npages = npages;
-	m->dram = aligned_alloc(4096, size);
+	m->dram = dram_alloc(m, size);
 	m->pa = calloc(npages, sizeof(*m->pa));
 	if (!m->dram || !m->pa)
 		goto err;
-	memset(m->dram, 0xa5, size);	/* real allocations aren't zeroed */
+	/* real allocations aren't zeroed (unless the e2e config asks for PW_MEM_ZEROED) */
+	memset(m->dram, (os->cfg.honor_zeroed && (flags & PW_MEM_ZEROED)) ? 0 : 0xa5, size);
 	if (flags & PW_MEM_KMAP) {
 		if (flags & PW_MEM_UNCACHED) {
 			m->cpu = m->dram;
 		} else {
-			m->cpu = aligned_alloc(4096, size);
+			m->cpu = mock_page_alloc(size);
 			if (!m->cpu)
 				goto err;
 			memcpy(m->cpu, m->dram, size);
@@ -258,8 +402,8 @@ int pw_os_mem_alloc(struct pw_os *os, size_t size, uint32_t flags, struct pw_os_
 
 err:
 	if (m->cpu && m->cpu != m->dram)
-		free(m->cpu);
-	free(m->dram);
+		mock_page_free(m->cpu);
+	dram_free(m);
 	free(m->pa);
 	free(m);
 	return PW_ENOMEM;
@@ -278,9 +422,11 @@ void pw_os_mem_free(struct pw_os *os, struct pw_os_mem *m)
 	}
 	os->mems--;
 	pthread_mutex_unlock(&os->lock);
+	if (m->user && m->user != m->dram && m->user != m->cpu)
+		mock_page_free(m->user);
 	if (m->cpu && m->cpu != m->dram)
-		free(m->cpu);
-	free(m->dram);
+		mock_page_free(m->cpu);
+	dram_free(m);
 	free(m->pa);
 	free(m);
 }
@@ -319,6 +465,8 @@ void pw_os_mem_flush(struct pw_os *os, struct pw_os_mem *m, size_t off, size_t s
 	check_range(m, off, size, "flush");
 	if (m->cpu && m->cpu != m->dram)
 		memcpy(m->dram + off, m->cpu + off, size);
+	else if (!m->cpu && m->user && m->user != m->dram)
+		memcpy(m->dram + off, m->user + off, size);
 }
 
 void pw_os_mem_invalidate(struct pw_os *os, struct pw_os_mem *m, size_t off, size_t size)
@@ -327,6 +475,59 @@ void pw_os_mem_invalidate(struct pw_os *os, struct pw_os_mem *m, size_t off, siz
 	check_range(m, off, size, "invalidate");
 	if (m->cpu && m->cpu != m->dram)
 		memcpy(m->cpu + off, m->dram + off, size);
+	else if (!m->cpu && m->user && m->user != m->dram)
+		memcpy(m->user + off, m->dram + off, size);
+}
+
+/*
+ * (e2e) What a user mapping of @m shows: for PW_MEM_UNCACHED (write-combined) memory the same
+ * bytes the GPU sees; for cached memory the CPU-cache view (the kernel view when there is one),
+ * which the GPU only sees through pw_os_mem_flush() and which only sees GPU writes after
+ * pw_os_mem_invalidate(). NULL on allocation failure. Stable for the life of @m.
+ */
+void *mock_mem_user_view(struct pw_os *os, struct pw_os_mem *m)
+{
+	void *v;
+
+	pthread_mutex_lock(&os->lock);
+	if (!m->user) {
+		if (m->flags & PW_MEM_UNCACHED) {
+			m->user = m->dram;
+		} else if (m->cpu) {
+			m->user = m->cpu;
+		} else {
+			m->user = mock_page_alloc(m->size);
+			if (m->user)
+				memcpy(m->user, m->dram, m->size);
+		}
+	}
+	v = m->user;
+	pthread_mutex_unlock(&os->lock);
+	return v;
+}
+
+void *mock_mem_user_map(struct pw_os *os, struct pw_os_mem *m, bool writable)
+{
+#ifdef _WIN32
+	if (m->flags & PW_MEM_UNCACHED)
+		return MapViewOfFile(m->section, writable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0,
+				     m->size);
+#endif
+	(void)writable;
+	return mock_mem_user_view(os, m);
+}
+
+void mock_mem_user_unmap(struct pw_os *os, struct pw_os_mem *m, void *view)
+{
+	(void)os;
+#ifdef _WIN32
+	if (m->flags & PW_MEM_UNCACHED) {
+		UnmapViewOfFile(view);
+		return;
+	}
+#endif
+	(void)m;
+	(void)view;
 }
 
 void *pw_os_zalloc(struct pw_os *os, size_t size)
@@ -399,15 +600,11 @@ void pw_os_mutex_unlock(struct pw_os_mutex *m)
 struct pw_os_event *pw_os_event_create(struct pw_os *os)
 {
 	struct pw_os_event *e = calloc(1, sizeof(*e));
-	pthread_condattr_t a;
 
 	if (!e)
 		return NULL;
 	pthread_mutex_init(&e->m, NULL);
-	pthread_condattr_init(&a);
-	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
-	pthread_cond_init(&e->c, &a);
-	pthread_condattr_destroy(&a);
+	mono_cond_init(&e->c);
 	__atomic_fetch_add(&os->syncs, 1, __ATOMIC_RELAXED);
 	return e;
 }
@@ -449,11 +646,11 @@ int pw_os_event_wait(struct pw_os_event *e, uint32_t timeout_ms)
 	struct timespec ts;
 	int ret = PW_OK;
 
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+	mono_timespec(&ts);
 	ts_add_ns(&ts, (uint64_t)timeout_ms * 1000000u);
 	pthread_mutex_lock(&e->m);
 	while (!e->set) {
-		if (pthread_cond_timedwait(&e->c, &e->m, &ts) == ETIMEDOUT) {
+		if (mono_cond_timedwait(&e->c, &e->m, &ts) == ETIMEDOUT) {
 			ret = e->set ? PW_OK : PW_ETIMEDOUT;
 			break;
 		}
@@ -464,11 +661,8 @@ int pw_os_event_wait(struct pw_os_event *e, uint32_t timeout_ms)
 
 uint64_t pw_os_time_ns(struct pw_os *os)
 {
-	struct timespec ts;
-
 	(void)os;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+	return mono_now_ns();
 }
 
 void pw_os_udelay(struct pw_os *os, uint32_t us)
@@ -704,6 +898,37 @@ int mock_gpu_read(struct pw_os *os, unsigned int as, uint64_t va, void *buf, siz
 	return r;
 }
 
+int mock_gpu_write(struct pw_os *os, unsigned int as, uint64_t va, const void *buf, size_t len)
+{
+	int r;
+
+	pthread_mutex_lock(&os->lock);
+	r = gpu_rw_locked(os, as, va, (void *)buf, len, true);
+	pthread_mutex_unlock(&os->lock);
+	return r;
+}
+
+int mock_gpu_rw_locked(struct pw_os *os, unsigned int as, uint64_t va, void *buf, size_t len,
+		       bool write)
+{
+	return gpu_rw_locked(os, as, va, buf, len, write);
+}
+
+void mock_lock(struct pw_os *os)
+{
+	pthread_mutex_lock(&os->lock);
+}
+
+void mock_unlock(struct pw_os *os)
+{
+	pthread_mutex_unlock(&os->lock);
+}
+
+struct mock_csf *mock_csf_of(struct pw_os *os)
+{
+	return os->csf;
+}
+
 /* ------------------------------------------------------------------------------------------ */
 /* emulated MCU                                                                               */
 /* ------------------------------------------------------------------------------------------ */
@@ -728,18 +953,30 @@ static uint64_t mr64(struct pw_os *os, uint32_t off)
 	return mr32(os, off) | ((uint64_t)mr32(os, off + 4) << 32);
 }
 
+uint32_t mock_sh_r32_locked(struct pw_os *os, uint32_t off)
+{
+	return mr32(os, off);
+}
+
+void mock_sh_w32_locked(struct pw_os *os, uint32_t off, uint32_t v)
+{
+	mw32(os, off, v);
+}
+
 static void raise_locked(struct pw_os *os, unsigned int line, uint32_t bits)
 {
 	os->rawstat[line] |= bits;
 	pthread_cond_broadcast(&os->cond);
 }
 
+void mock_raise_job_locked(struct pw_os *os, uint32_t bits)
+{
+	raise_locked(os, 0, bits);
+}
+
 static uint64_t mono_ns(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+	return mono_now_ns();
 }
 
 /* Completion events show up asynchronously, after the configured latency. */
@@ -827,13 +1064,14 @@ static void mcu_boot_locked(struct pw_os *os)
 		}
 	}
 
+	mock_csf_reset_locked(os);
 	os->mcu_running = true;
 	raise_later_locked(os, 0, JOB_GLOBAL_IF);
 }
 
 static void mcu_glb_doorbell_locked(struct pw_os *os)
 {
-	uint32_t req, ack, new_ack, irq_mask;
+	uint32_t req, ack, new_ack, irq_mask, db, csg_mask;
 
 	os->glb.doorbells++;
 	if (!os->mcu_running || os->cfg.fw_variant == MOCK_FW_IGNORE_DOORBELL)
@@ -856,9 +1094,14 @@ static void mcu_glb_doorbell_locked(struct pw_os *os)
 	if (req & 1u)
 		os->mcu_status = 2;	/* HALT */
 	mw32(os, GLB_OUT + 0x00, new_ack);
-	mw32(os, GLB_OUT + 0x08, mr32(os, GLB_IN + 0x08));	/* doorbell_ack = doorbell_req */
+	/* doorbell_ack = doorbell_req; the toggled bits are CSG doorbells. */
+	db = mr32(os, GLB_IN + 0x08);
+	csg_mask = (db ^ mr32(os, GLB_OUT + 0x08)) & ((1u << MOCK_FW_GROUP_NUM) - 1u);
+	mw32(os, GLB_OUT + 0x08, db);
 	if ((new_ack ^ ack) & irq_mask)
 		raise_locked(os, 0, JOB_GLOBAL_IF);
+	if (csg_mask)
+		mock_csf_glb_doorbell_locked(os, csg_mask);
 }
 
 void mock_mcu_raise_glb_event(struct pw_os *os, uint32_t bits)
@@ -921,6 +1164,7 @@ static void soft_reset_locked(struct pw_os *os)
 	memset(os->as_busy, 0, sizeof(os->as_busy));
 	os->mcu_running = false;
 	os->mcu_status = 0;
+	mock_csf_reset_locked(os);
 	memset(os->delayed_bits, 0, sizeof(os->delayed_bits));
 	raise_later_locked(os, 2, GPU_IRQ_RESET_COMPLETED);
 }
@@ -1062,6 +1306,8 @@ void pw_os_reg_write32(struct pw_os *os, uint32_t off, uint32_t v)
 	if (off >= R_DOORBELL0 && ((off - R_DOORBELL0) & 0xffff) == 0) {
 		if (off == R_DOORBELL0)
 			mcu_glb_doorbell_locked(os);
+		else if (os->mcu_running)
+			mock_csf_doorbell_locked(os, (off - R_DOORBELL0) >> 16);
 		goto out;
 	}
 	if (off >= R_AS(0) && off < R_AS(16)) {
@@ -1100,6 +1346,7 @@ void pw_os_reg_write32(struct pw_os *os, uint32_t off, uint32_t v)
 		} else if (v == 0) {
 			os->mcu_running = false;
 			os->mcu_status = 0;
+			mock_csf_reset_locked(os);
 		}
 		break;
 	default:
@@ -1141,9 +1388,9 @@ static void *irq_thread_fn(void *arg)
 				struct timespec ts;
 
 				os->unclaimed++;
-				clock_gettime(CLOCK_MONOTONIC, &ts);
+				mono_timespec(&ts);
 				ts_add_ns(&ts, 1000000);
-				pthread_cond_timedwait(&os->cond, &os->lock, &ts);
+				mono_cond_timedwait(&os->cond, &os->lock, &ts);
 			}
 			pthread_cond_broadcast(&os->cond);
 			continue;
@@ -1158,9 +1405,9 @@ static void *irq_thread_fn(void *arg)
 		}
 		if (!wait_ns)
 			continue;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
+		mono_timespec(&ts);
 		ts_add_ns(&ts, wait_ns);
-		pthread_cond_timedwait(&os->cond, &os->lock, &ts);
+		mono_cond_timedwait(&os->cond, &os->lock, &ts);
 	}
 	pthread_mutex_unlock(&os->lock);
 	return NULL;
@@ -1342,7 +1589,6 @@ static void set64(struct pw_os *os, uint32_t off, uint64_t v)
 struct pw_os *mock_create(const struct mock_config *cfg)
 {
 	struct pw_os *os = calloc(1, sizeof(*os));
-	pthread_condattr_t a;
 
 	if (!os)
 		abort();
@@ -1358,14 +1604,12 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 	os->verbose = getenv("PW_TEST_VERBOSE") != NULL;
 	os->regs = calloc(REG_SPACE / 4, sizeof(uint32_t));
 	os->pa_pages = calloc(PA_NPAGES, sizeof(*os->pa_pages));
-	if (!os->regs || !os->pa_pages)
+	os->csf = mock_csf_create();
+	if (!os->regs || !os->pa_pages || !os->csf)
 		abort();
 
 	pthread_mutex_init(&os->lock, NULL);
-	pthread_condattr_init(&a);
-	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
-	pthread_cond_init(&os->cond, &a);
-	pthread_condattr_destroy(&a);
+	mono_cond_init(&os->cond);
 
 	os->regs[0x0 / 4] = os->cfg.gpu_id;
 	os->regs[0x4 / 4] = MOCK_G610_L2_FEATURES;
@@ -1410,6 +1654,7 @@ void mock_destroy(struct pw_os *os)
 	free(os->log);
 	free(os->regs);
 	free(os->pa_pages);
+	mock_csf_destroy(os->csf);
 	free(os);
 }
 
@@ -1426,7 +1671,7 @@ int pw_os_event_wait_user(struct pw_os_event *e, uint64_t deadline_ns)
 	while (!e->set) {
 		if (deadline_ns == UINT64_MAX) {
 			pthread_cond_wait(&e->c, &e->m);
-		} else if (pthread_cond_timedwait(&e->c, &e->m, &ts) == ETIMEDOUT) {
+		} else if (mono_cond_timedwait(&e->c, &e->m, &ts) == ETIMEDOUT) {
 			ret = e->set ? PW_OK : PW_ETIMEDOUT;
 			break;
 		}
@@ -1489,7 +1734,7 @@ static void *work_thread(void *arg)
 					.tv_sec = (time_t)(w->not_before_ns / 1000000000u),
 					.tv_nsec = (long)(w->not_before_ns % 1000000000u),
 				};
-				pthread_cond_timedwait(&w->c, &w->m, &ts);
+				mono_cond_timedwait(&w->c, &w->m, &ts);
 				continue;
 			}
 			if (w->stop) {	/* destroy cancels a pending delayed run */
@@ -1514,7 +1759,6 @@ static void *work_thread(void *arg)
 struct pw_os_work *pw_os_work_create(struct pw_os *os, pw_os_work_fn fn, void *ctx)
 {
 	struct pw_os_work *w = calloc(1, sizeof(*w));
-	pthread_condattr_t a;
 
 	if (!w)
 		return NULL;
@@ -1522,10 +1766,7 @@ struct pw_os_work *pw_os_work_create(struct pw_os *os, pw_os_work_fn fn, void *c
 	w->fn = fn;
 	w->ctx = ctx;
 	pthread_mutex_init(&w->m, NULL);
-	pthread_condattr_init(&a);
-	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
-	pthread_cond_init(&w->c, &a);
-	pthread_condattr_destroy(&a);
+	mono_cond_init(&w->c);
 	if (pthread_create(&w->thr, NULL, work_thread, w)) {
 		pthread_cond_destroy(&w->c);
 		pthread_mutex_destroy(&w->m);

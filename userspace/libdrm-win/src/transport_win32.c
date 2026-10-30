@@ -4,7 +4,15 @@
  *
  * NtDeviceIoControlFile (rather than DeviceIoControl) is used so the raw NTSTATUS reaches
  * panwin_ntstatus_to_errno(): kernel32 would squash it through RtlNtStatusToDosError and lose the
- * custom errno-carrying status codes (and turn STATUS_TIMEOUT into success).
+ * errno-carrying PANWIN_STATUS_FROM_ERRNO codes (and turn STATUS_TIMEOUT into success).
+ *
+ * The device is opened FILE_FLAG_OVERLAPPED. On a synchronous handle the I/O manager serializes
+ * every request on the file object (it holds the file object lock until the IRP completes), so
+ * a DRM_IOCTL_SYNCOBJ_WAIT blocking in one thread would block the SIGNAL/submit that should
+ * wake it in another thread: a deadlock, since Mesa shares one DRM fd between threads.
+ * panwin.sys completes every request in the caller's context before returning, so
+ * STATUS_PENDING is not expected; each call still passes a per-thread event and waits on it if
+ * the request does pend.
  *
  * Enumeration: every present interface of PANWIN_INTERFACE_GUID, in SetupAPI order. If there is
  * none, the fixed symbolic link \\.\PanWin0 is used when it exists. The environment variable
@@ -26,17 +34,49 @@
 #ifndef STATUS_PENDING
 #define STATUS_PENDING ((NTSTATUS)0x00000103L)
 #endif
-#ifndef STATUS_USER_APC
-#define STATUS_USER_APC ((NTSTATUS)0x000000C0L)
-#endif
-#ifndef STATUS_ALERTED
-#define STATUS_ALERTED ((NTSTATUS)0x00000101L)
-#endif
-#ifndef STATUS_TIMEOUT
-#define STATUS_TIMEOUT ((NTSTATUS)0x00000102L)
-#endif
 
 static const GUID panwin_guid = PANWIN_INTERFACE_GUID_INIT;
+
+/* ---- per-thread completion event (auto-reset), closed by the FLS callback at thread exit ---- */
+
+static INIT_ONCE fls_once = INIT_ONCE_STATIC_INIT;
+static DWORD fls_index = FLS_OUT_OF_INDEXES;
+
+static void WINAPI fls_event_free(void *p)
+{
+	if (p)
+		CloseHandle((HANDLE)p);
+}
+
+static BOOL CALLBACK fls_init(INIT_ONCE *once, void *param, void **ctx)
+{
+	(void)once;
+	(void)param;
+	(void)ctx;
+	fls_index = FlsAlloc(fls_event_free);
+	return TRUE;
+}
+
+/* Returns the calling thread's event, or a new one the caller must close (*owned = true). */
+static HANDLE thread_event(bool *owned)
+{
+	HANDLE ev;
+
+	*owned = false;
+	InitOnceExecuteOnce(&fls_once, fls_init, NULL, NULL);
+	if (fls_index != FLS_OUT_OF_INDEXES) {
+		ev = FlsGetValue(fls_index);
+		if (ev)
+			return ev;
+		ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+		if (ev && FlsSetValue(fls_index, ev))
+			return ev;
+	} else {
+		ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+	}
+	*owned = ev != NULL;
+	return ev;
+}
 
 static SRWLOCK dev_lock = SRWLOCK_INIT;
 static WCHAR *dev_paths[PW_MAX_DEVICES];
@@ -145,7 +185,7 @@ static int w32_open(int index, void **file)
 	if (index >= 0 && index < dev_count) {
 		h = CreateFileW(dev_paths[index], GENERIC_READ | GENERIC_WRITE,
 				FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-				FILE_ATTRIBUTE_NORMAL, NULL);
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 		if (h == INVALID_HANDLE_VALUE)
 			err = GetLastError();
 	}
@@ -162,29 +202,28 @@ static void w32_close(void *file)
 	CloseHandle((HANDLE)file);
 }
 
-static int w32_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size, uint32_t out_size,
-		     uint32_t *returned)
+static int32_t w32_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size,
+			 uint32_t out_size, uint32_t *returned)
 {
 	IO_STATUS_BLOCK iosb;
 	NTSTATUS st;
+	bool owned;
+	HANDLE ev = thread_event(&owned);
 
+	if (!ev)
+		return (int32_t)0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
 	memset(&iosb, 0, sizeof(iosb));
-	st = NtDeviceIoControlFile((HANDLE)file, NULL, NULL, NULL, &iosb, code,
+	st = NtDeviceIoControlFile((HANDLE)file, ev, NULL, NULL, &iosb, code,
 				   in_size ? buf : NULL, in_size, out_size ? buf : NULL, out_size);
 	if (st == STATUS_PENDING) {
-		/* Synchronous handles never pend, but be safe. */
-		WaitForSingleObject((HANDLE)file, INFINITE);
+		WaitForSingleObject(ev, INFINITE);
 		st = iosb.Status;
 	}
+	if (owned)
+		CloseHandle(ev);
 	if (returned)
-		*returned = (uint32_t)iosb.Information;
-	if (st == 0)
-		return 0;
-	/* STATUS_TIMEOUT, STATUS_USER_APC and STATUS_ALERTED are success-class but mean the
-	 * request did not complete (ETIME / EINTR); every other success code is success. */
-	if (st >= 0 && st != STATUS_TIMEOUT && st != STATUS_USER_APC && st != STATUS_ALERTED)
-		return 0;
-	return -panwin_ntstatus_to_errno((int32_t)st);
+		*returned = st >= 0 ? (uint32_t)iosb.Information : 0;
+	return (int32_t)st;
 }
 
 static void *w32_os_handle(void *file)
@@ -192,7 +231,8 @@ static void *w32_os_handle(void *file)
 	return file;
 }
 
-const struct pw_transport pw_transport_win32 = {
+const struct panwin_transport pw_transport_win32 = {
+	.version = PANWIN_TRANSPORT_VERSION,
 	.name = "real",
 	.enumerate = w32_enumerate,
 	.device_path = w32_device_path,

@@ -60,6 +60,8 @@ EXPORTS
 	panwin_ntstatus_to_errno
 	panwin_open
 	panwin_private_ioctl
+	panwin_register_transport
+	panwin_select_transport
 	panwin_stat_rdev
 	panwin_syncobj_event
 	panwin_transport_name

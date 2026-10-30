@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * panwin-info: bring-up tool for panwin.sys. Opens a device through libdrm-win and prints
- * PANWIN_IOCTL_GET_INFO, drmGetVersion, DEV_QUERY GPU_INFO / CSIF_INFO (decoded), and optional
- * raw register reads (PANWIN_IOCTL_DEBUG_REG_READ, debug builds of panwin.sys only).
+ * PANWIN_IOCTL_GET_INFO, drmGetVersion, DEV_QUERY GPU_INFO / CSIF_INFO (decoded), the user MMIO
+ * page (LATEST_FLUSH_ID, through PANWIN_IOCTL_MMAP: exercises the kernel's read-only MMIO
+ * mapping path), and optional raw register reads (PANWIN_IOCTL_DEBUG_REG_READ, debug builds of
+ * panwin.sys only). Opens with PANWIN_O_NOABICHECK so a driver/DLL ABI mismatch is reported
+ * instead of failing the open.
  *
- *   panwin-info [--device N] [--reg OFFSET]... [--fake] [--list]
+ *   panwin-info [--device N] [--reg OFFSET]... [--fake] [--transport NAME] [--list]
  */
 #include <errno.h>
 #include <inttypes.h>
@@ -105,10 +108,11 @@ static void print_gpu_info(const struct drm_panthor_gpu_info *g)
 
 static void usage(const char *argv0)
 {
-	printf("usage: %s [--device N] [--reg OFFSET]... [--fake] [--list]\n"
+	printf("usage: %s [--device N] [--reg OFFSET]... [--fake] [--transport NAME] [--list]\n"
 	       "  --device N    open /dev/dri/renderD(128+N) (default 0)\n"
 	       "  --reg OFFSET  read a GPU register (hex or decimal; debug panwin.sys builds only)\n"
 	       "  --fake        use libdrm-win's in-process fake kernel (needs -Dfake_kernel=true)\n"
+	       "  --transport NAME  libdrm-win transport: real, fake, a registered name, dll:<path>\n"
 	       "  --list        only list devices\n", argv0);
 }
 
@@ -125,6 +129,11 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--fake")) {
 			if (panwin_use_fake_kernel(1)) {
 				fprintf(stderr, "--fake: %s\n", err_str(errno));
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
+			if (panwin_select_transport(argv[++i])) {
+				fprintf(stderr, "--transport %s: %s\n", argv[i], err_str(errno));
 				return 2;
 			}
 		} else if (!strcmp(argv[i], "--list")) {
@@ -160,7 +169,7 @@ int main(int argc, char **argv)
 
 	char node[32];
 	snprintf(node, sizeof(node), "/dev/dri/renderD%d", 128 + index);
-	int fd = panwin_open(node, 0);
+	int fd = panwin_open(node, PANWIN_O_NOABICHECK);
 	if (fd < 0) {
 		fprintf(stderr, "open %s: %s\n", node, err_str(errno));
 		return 1;
@@ -215,6 +224,18 @@ int main(int argc, char **argv)
 		printf("CSIF_INFO:\n  csg_slots %u, cs_slots/group %u, cs_regs %u, scoreboards %u, "
 		       "unpreserved_cs_regs %u\n", csif.csg_slot_count, csif.cs_slot_count, csif.cs_reg_count,
 		       csif.scoreboard_slot_count, csif.unpreserved_cs_reg_count);
+	}
+
+	/* panthor_kmod.c maps this page unconditionally (DRM_PANTHOR_USER_MMIO_OFFSET is the 32-bit
+	 * variant on LLP64; the kernel accepts both). */
+	volatile uint32_t *flush = panwin_mmap(fd, DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET, 4096, 1);
+	if (!flush) {
+		printf("user MMIO page: mmap failed: %s\n", err_str(errno));
+		rc = 1;
+	} else {
+		printf("user MMIO page: LATEST_FLUSH_ID = 0x%08" PRIx32 " (mapped read-only at %p)\n",
+		       flush[0], (void *)flush);
+		panwin_munmap((void *)flush, 4096);
 	}
 
 	for (int i = 0; i < nregs; i++) {

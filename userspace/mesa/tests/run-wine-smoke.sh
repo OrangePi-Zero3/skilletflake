@@ -4,6 +4,8 @@
 # Build tests/icd_smoke.c for x86_64 and run it under wine against the x86_64 vulkan_panfrost.dll
 # produced by `build.sh x86_64`: once with no device (expect 0 physical devices) and once with
 # libdrm-win's fake kernel (PANWIN_FAKE_KERNEL=1, only in libdrm-win builds with -Dfake_kernel).
+# If libdrm-win was also built with -Dcore_transport=true (repo/out/x86_64-core, see
+# tests/e2e/run.sh), the device-creation run is repeated on the REAL kmd/core + mock G610.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -27,3 +29,13 @@ PANWIN_FAKE_KERNEL=1 PANVK_DEBUG=${PANVK_DEBUG:-startup} \
 echo "--- fake kernel + vkCreateDevice (informational: needs VM_BIND, GROUP_CREATE, ... in the fake)"
 PANWIN_FAKE_KERNEL=1 wine ./icd_smoke.exe vulkan_panfrost.dll --require-device --create-device ||
 	echo "(vkCreateDevice failed; see the ioctl error above)"
+core_drm="$here/../../../out/x86_64-core/bin/libdrm.dll"
+if [ -f "$core_drm" ]; then
+	echo "--- kmd/core + mock G610 in-process (PANWIN_TRANSPORT=core) + vkCreateDevice"
+	core_dir="$here/../../../out/mesa-smoke-core"
+	mkdir -p "$core_dir"
+	cp vulkan_panfrost.dll icd_smoke.exe "$core_dir/"
+	cp "$core_drm" "$core_dir/"
+	(cd "$core_dir" && PANWIN_TRANSPORT=core PANWIN_CORE_REPORT=1 \
+		wine ./icd_smoke.exe vulkan_panfrost.dll --require-device --create-device)
+fi

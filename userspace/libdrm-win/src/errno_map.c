@@ -2,27 +2,26 @@
 /*
  * NTSTATUS / Win32 error -> errno mapping.
  *
- * The standard-status table also inverts kmd/win/pw_win_ioctl.c:pw_win_status_from_errno()
- * (e.g. STATUS_DEVICE_NOT_READY = -ENODEV, STATUS_QUOTA_EXCEEDED = -ENOSPC). Keep them in sync.
+ * The standard-status table keeps the ABI v1 mapping of kmd/win (STATUS_DEVICE_NOT_READY =
+ * ENODEV, STATUS_QUOTA_EXCEEDED = ENOSPC, ...) so an old driver still decodes sensibly; ABI v2
+ * panwin.sys sends errno-carrying statuses for every failure it produces itself.
  *
  * panwin.sys completes IRPs with an NTSTATUS. Two forms are understood:
- *  1. Standard NTSTATUS codes (STATUS_INVALID_PARAMETER, ...) mapped with the table below.
- *  2. A customer-defined code carrying the exact Linux errno from the OS-neutral core
- *     (which uses Linux errno values, see kmd/core/pw_os.h):
- *        PW_NTSTATUS_LINUX_ERRNO(e) = 0xE0000000 | (0xD52 << 16) | e      (e = positive Linux errno)
- *     (sev=error, customer bit, facility 0xD52). Proposed as a contract addition; see
- *     docs/status/libdrm-win.md. Linux errno numbers differ from the Windows CRT's (ETIME is 62 on
- *     Linux, 137 in UCRT), so they are translated to CRT errno values here.
+ *  1. ABI v2 (include/panwin/panwin_ioctl.h): a failing DRM / private ioctl completes with
+ *     PANWIN_STATUS_FROM_ERRNO(e) = 0xE0000000 | (0xD52 << 16) | e (sev=error, customer bit,
+ *     facility 0xD52, e = positive Linux errno from the OS-neutral core). Linux errno numbers
+ *     differ from the Windows CRT's (ETIME is 62 on Linux, 137 in UCRT), so they are translated
+ *     to CRT errno values here; ETIME and ETIMEDOUT stay distinct.
+ *  2. Standard NTSTATUS codes, produced by the I/O manager / KMDF (invalid handle, buffer
+ *     checks, unknown ioctl = STATUS_INVALID_DEVICE_REQUEST, ...), mapped with the table below.
  */
 #include <errno.h>
 #include <stdint.h>
 #include <windows.h>
 
+#include "panwin/panwin_ioctl.h"
 #include "libdrm_win.h"
 #include "pw_internal.h"
-
-#define PW_NTSTATUS_LINUX_ERRNO_BASE 0xED520000u
-#define PW_NTSTATUS_LINUX_ERRNO_MASK 0xFFFF0000u
 
 /* Linux asm-generic errno numbers -> Windows CRT errno. */
 static int linux_errno_to_crt(unsigned e)
@@ -72,8 +71,8 @@ int panwin_ntstatus_to_errno(int32_t status)
 {
 	uint32_t s = (uint32_t)status;
 
-	if ((s & PW_NTSTATUS_LINUX_ERRNO_MASK) == PW_NTSTATUS_LINUX_ERRNO_BASE)
-		return linux_errno_to_crt(s & 0xFFFFu);
+	if (PANWIN_STATUS_IS_ERRNO(s))
+		return linux_errno_to_crt((unsigned)PANWIN_STATUS_TO_ERRNO(s));
 
 	switch (s) {
 	case 0x00000000u: return 0;                 /* STATUS_SUCCESS */
@@ -117,6 +116,19 @@ int panwin_ntstatus_to_errno(int32_t status)
 	if (s >= 0xC00000EFu && s <= 0xC00000FAu)   /* STATUS_INVALID_PARAMETER_1..12 */
 		return EINVAL;
 	return EIO;
+}
+
+int pw_ioctl_status_to_errno(int32_t status)
+{
+	uint32_t s = (uint32_t)status;
+
+	if (s == 0)
+		return 0;
+	/* STATUS_TIMEOUT, STATUS_USER_APC and STATUS_ALERTED are success-class but mean the
+	 * request did not complete (ETIME / EINTR); every other success code is success. */
+	if (status > 0 && s != 0x102u && s != 0xC0u && s != 0x101u)
+		return 0;
+	return panwin_ntstatus_to_errno(status);
 }
 
 int panwin_win32_error_to_errno(uint32_t err)

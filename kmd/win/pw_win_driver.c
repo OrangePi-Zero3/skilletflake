@@ -11,6 +11,9 @@
  *   EvtDeviceD0EntryPostInterruptsEnabled  pw_device_alloc(), publish to the ISR, then
  *                                     pw_device_probe() - IRQs are live, so the core can wait
  *                                     for interrupt-driven events while it boots
+ *   EvtDeviceD0ExitPreInterruptsDisabled   stop new users of the core, revoke every open file
+ *                                     (user waits interrupted, user mappings and notifies torn
+ *                                     down, pw_file_close) while IRQs still work
  *   (KMDF disconnects the interrupts, flushing queued ISR work items)
  *   EvtDeviceD0Exit                   pw_device_destroy()     - no ISR/work item can run
  *   EvtDeviceReleaseHardware          unmap MMIO
@@ -29,6 +32,7 @@ static EVT_WDF_DEVICE_PREPARE_HARDWARE pw_win_prepare_hardware;
 static EVT_WDF_DEVICE_RELEASE_HARDWARE pw_win_release_hardware;
 static EVT_WDF_DEVICE_D0_ENTRY pw_win_d0_entry;
 static EVT_WDF_DEVICE_D0_ENTRY_POST_INTERRUPTS_ENABLED pw_win_d0_entry_post_irq;
+static EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED pw_win_d0_exit_pre_irq;
 static EVT_WDF_DEVICE_D0_EXIT pw_win_d0_exit;
 static EVT_WDF_INTERRUPT_ISR pw_win_isr;
 static EVT_WDF_INTERRUPT_WORKITEM pw_win_irq_work;
@@ -81,6 +85,17 @@ static PVOID pw_win_map_io(PHYSICAL_ADDRESS pa, SIZE_T len)
 	if (pw_win_rt.MmMapIoSpaceEx)
 		return pw_win_rt.MmMapIoSpaceEx(pa, len, PAGE_READWRITE | PAGE_NOCACHE);
 	return MmMapIoSpace(pa, len, MmNonCached);
+}
+
+/* Architected timer frequency (CNTFRQ_EL0, readable at EL1; firmware programs it, 24 MHz on
+ * RK3588). Passed to the core for FW timeouts; 0 lets the core use its default. */
+static uint32_t pw_win_read_cntfrq(void)
+{
+	uint64_t f;
+
+	__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(f));
+	PW_WLOG(PW_LOG_INFO, "CNTFRQ_EL0 = %lu Hz", (unsigned long)f);
+	return f > 0xFFFFFFFFu ? 0 : (uint32_t)f;
 }
 
 /* ------------------------------------------------------------------- registry params */
@@ -358,6 +373,7 @@ static NTSTATUS pw_win_d0_entry_post_irq(WDFDEVICE device, WDF_POWER_DEVICE_STAT
 		.os = &ctx->os,
 		.fw_name = ctx->fw_name[0] ? ctx->fw_name : NULL,
 		.boot_firmware = ctx->boot_firmware != 0,
+		.timer_hz = ctx->timer_hz,
 	};
 	struct pw_device *pw = NULL;
 	char desc[128];
@@ -397,19 +413,39 @@ static NTSTATUS pw_win_d0_entry_post_irq(WDFDEVICE device, WDF_POWER_DEVICE_STAT
 	return STATUS_SUCCESS;
 }
 
+/*
+ * First half of the way down, interrupts still connected: no new file or device-level ioctl may
+ * reach the core (core_ready = 0, core_rundown), and every open file is revoked - its pending
+ * user waits end with EINTR (libdrm-win retries and then gets ENODEV), its user mappings (BOs
+ * and the MMIO page) are unmapped and its core state is released with pw_file_close(). The
+ * handles stay open; later ioctls on them fail with ENODEV (a "device lost" for the client).
+ */
+static NTSTATUS pw_win_d0_exit_pre_irq(WDFDEVICE device, WDF_POWER_DEVICE_STATE target)
+{
+	PW_DEVICE_CTX *ctx = PwDeviceCtx(device);
+
+	(void)target;
+	__atomic_store_n(&ctx->core_ready, 0, __ATOMIC_RELEASE);
+	ExWaitForRundownProtectionRelease(&ctx->core_rundown);
+	pw_win_revoke_files(ctx);
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS pw_win_d0_exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE target)
 {
 	PW_DEVICE_CTX *ctx = PwDeviceCtx(device);
 	struct pw_device *pw;
 
 	(void)target;
-	/* Interrupts are already disconnected and their work items flushed by KMDF, and the
-	 * power-managed queue is stopped, so nothing else can be using the core device. */
+	/* Interrupts are already disconnected and their work items flushed by KMDF, and
+	 * pw_win_d0_exit_pre_irq() revoked every file and drained device-level users, so nothing
+	 * else can be using the core device. */
 	__atomic_store_n(&ctx->core_ready, 0, __ATOMIC_RELEASE);
 	pw = __atomic_exchange_n(&ctx->pw, NULL, __ATOMIC_ACQ_REL);
 	if (pw)
 		pw_device_destroy(pw);
 	__atomic_store_n(&ctx->os.regs_enabled, 0, __ATOMIC_SEQ_CST);
+	ExReInitializeRundownProtection(&ctx->core_rundown); /* for the next D0Entry */
 	if (ctx->irq_spurious[0] | ctx->irq_spurious[1] | ctx->irq_spurious[2])
 		PW_WLOG(PW_LOG_WARN, "lines masked by glue this session: job %lu mmu %lu gpu %lu",
 			(unsigned long)ctx->irq_spurious[0], (unsigned long)ctx->irq_spurious[1],
@@ -439,6 +475,7 @@ static NTSTATUS pw_win_device_add(WDFDRIVER driver, PWDFDEVICE_INIT init)
 	pnp.EvtDeviceReleaseHardware = pw_win_release_hardware;
 	pnp.EvtDeviceD0Entry = pw_win_d0_entry;
 	pnp.EvtDeviceD0EntryPostInterruptsEnabled = pw_win_d0_entry_post_irq;
+	pnp.EvtDeviceD0ExitPreInterruptsDisabled = pw_win_d0_exit_pre_irq;
 	pnp.EvtDeviceD0Exit = pw_win_d0_exit;
 	WdfDeviceInitSetPnpPowerEventCallbacks(init, &pnp);
 
@@ -460,7 +497,9 @@ static NTSTATUS pw_win_device_add(WDFDRIVER driver, PWDFDEVICE_INIT init)
 	ctx = PwDeviceCtx(device);
 	ctx->device = device;
 	pw_os_win_init(&ctx->os, device);
+	pw_win_files_init(ctx);
 	pw_win_read_params(ctx);
+	ctx->timer_hz = pw_win_read_cntfrq();
 
 	st = WdfDeviceCreateDeviceInterface(device, &pw_interface_guid, NULL);
 	if (!NT_SUCCESS(st)) {
@@ -490,11 +529,13 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registr
 {
 	WDF_DRIVER_CONFIG cfg;
 	NTSTATUS st;
+	uint32_t maj, min, patch;
 
 	pw_win_resolve_routines();
-	PW_WLOG(PW_LOG_INFO, "panwin.sys " PANWIN_VERSION_STRING " (ABI %u, panthor uAPI %d.%d%s), "
-		"ExAllocatePool2 %s, MmMapIoSpaceEx %s", PANWIN_ABI_VERSION, PW_DRM_VERSION_MAJOR,
-		PW_DRM_VERSION_MINOR, PANWIN_DEBUG_IOCTLS ? ", debug ioctls" : "",
+	pw_core_drm_version(&maj, &min, &patch);
+	PW_WLOG(PW_LOG_INFO, "panwin.sys " PANWIN_VERSION_STRING " (ABI %u, panthor uAPI %u.%u.%u%s), "
+		"ExAllocatePool2 %s, MmMapIoSpaceEx %s", PANWIN_ABI_VERSION, maj, min, patch,
+		PANWIN_DEBUG_IOCTLS ? ", debug ioctls" : "",
 		pw_win_rt.ExAllocatePool2 ? "yes" : "no", pw_win_rt.MmMapIoSpaceEx ? "yes" : "no");
 
 	WDF_DRIVER_CONFIG_INIT(&cfg, pw_win_device_add);

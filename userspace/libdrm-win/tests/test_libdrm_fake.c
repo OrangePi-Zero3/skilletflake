@@ -36,11 +36,19 @@ static void test_errno_map(void)
 	CHECK(panwin_ntstatus_to_errno((int32_t)0xC00000B5u) == ETIME);
 	CHECK(panwin_ntstatus_to_errno((int32_t)0x00000102u) == ETIME);
 	CHECK(panwin_ntstatus_to_errno((int32_t)0xC00000F1u) == EINVAL);
-	/* Linux errno carried in the customer NTSTATUS */
-	CHECK(panwin_ntstatus_to_errno((int32_t)(0xED520000u | 62)) == ETIME);
-	CHECK(panwin_ntstatus_to_errno((int32_t)(0xED520000u | 38)) == ENOSYS);
-	CHECK(panwin_ntstatus_to_errno((int32_t)(0xED520000u | 110)) == ETIMEDOUT);
-	CHECK(panwin_ntstatus_to_errno((int32_t)(0xED520000u | 95)) == EOPNOTSUPP);
+	/* ABI v2: Linux errno carried in the customer NTSTATUS */
+	CHECK((uint32_t)PANWIN_STATUS_FROM_ERRNO(62) == 0xED52003Eu);
+	CHECK(PANWIN_STATUS_IS_ERRNO(PANWIN_STATUS_FROM_ERRNO(4095)) &&
+	      PANWIN_STATUS_TO_ERRNO(PANWIN_STATUS_FROM_ERRNO(4095)) == 4095);
+	CHECK(!PANWIN_STATUS_IS_ERRNO(0xC000000Du));
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(62)) == ETIME);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(110)) == ETIMEDOUT); /* distinct */
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(38)) == ENOSYS);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(95)) == EOPNOTSUPP);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(4)) == EINTR);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(19)) == ENODEV);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(25)) == ENOTTY);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(9)) == EBADF);
 	/* Inverse of kmd/win/pw_win_ioctl.c:pw_win_status_from_errno(). */
 	CHECK(panwin_ntstatus_to_errno((int32_t)0xC00000A3u) == ENODEV);  /* DEVICE_NOT_READY */
 	CHECK(panwin_ntstatus_to_errno((int32_t)0xC0000044u) == ENOSPC);  /* QUOTA_EXCEEDED */
@@ -48,7 +56,7 @@ static void test_errno_map(void)
 	CHECK(panwin_ntstatus_to_errno((int32_t)0x80000011u) == EBUSY);   /* DEVICE_BUSY */
 	CHECK(panwin_ntstatus_to_errno((int32_t)0x8000000Fu) == ENODEV);  /* DEVICE_POWERED_OFF */
 	CHECK(panwin_ntstatus_to_errno((int32_t)0xC0000225u) == ENOENT);  /* NOT_FOUND */
-	CHECK(panwin_ntstatus_to_errno((int32_t)(0xED520000u | 35)) == EDEADLK);
+	CHECK(panwin_ntstatus_to_errno(PANWIN_STATUS_FROM_ERRNO(35)) == EDEADLK);
 	CHECK(panwin_win32_error_to_errno(ERROR_FILE_NOT_FOUND) == ENOENT);
 	CHECK(panwin_win32_error_to_errno(ERROR_ACCESS_DENIED) == EACCES);
 	CHECK(panwin_win32_error_to_errno(ERROR_SEM_TIMEOUT) == ETIME);
@@ -215,10 +223,21 @@ static void test_syncobj(int fd)
 	CHECK(drmSyncobjQuery(fd, &t, &q, 1) == 0 && q == 9);
 	CHECK(drmSyncobjTransfer(fd, a, 0, t, 10, 0) == -1 && errno == EINVAL);
 
-	/* Event replacement for poll()/eventfd. */
+	/* Event replacement for poll()/eventfd (ABI v2: the event is created in user mode). */
 	void *ev = NULL;
 	p = 12;
-	CHECK(panwin_syncobj_event(fd, t, 12, 0, &ev) == 0 && ev);
+	/* No fence for point 12 and no WAIT_FOR_SUBMIT: EINVAL, like WAIT. */
+	CHECK(panwin_syncobj_event(fd, t, 12, 0, &ev) == -1 && errno == EINVAL && !ev);
+	CHECK(panwin_syncobj_event(fd, 0xdead, 0, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, &ev) == -1 &&
+	      errno == EINVAL);
+	/* Already signalled point: set immediately. */
+	CHECK(panwin_syncobj_event(fd, t, 9, 0, &ev) == 0 && ev);
+	if (ev) {
+		CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+		CloseHandle(ev);
+		ev = NULL;
+	}
+	CHECK(panwin_syncobj_event(fd, t, 12, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, &ev) == 0 && ev);
 	if (ev) {
 		CHECK(WaitForSingleObject(ev, 0) == WAIT_TIMEOUT);
 		CHECK(drmSyncobjTimelineSignal(fd, &t, &p, 1) == 0);
@@ -367,6 +386,107 @@ static void test_fd_exhaustion(void)
 	CHECK(panwin_close(base) == 0);
 }
 
+/* ---- transport injection (what the later in-process real-core transport plugs into) ---- */
+
+static int tt_ioctls, tt_abi = 1;
+
+static int tt_enumerate(void) { return 1; }
+static int tt_device_path(int index, char *buf, size_t len)
+{
+	if (index != 0)
+		return -ENOENT;
+	snprintf(buf, len, "test:%d", index);
+	return 0;
+}
+static int tt_open(int index, void **file)
+{
+	*file = (void *)(uintptr_t)(0x1000 + index);
+	return 0;
+}
+static void tt_close(void *file) { (void)file; }
+static int32_t tt_ioctl(void *file, uint32_t code, void *buf, uint32_t in_size, uint32_t out_size,
+			uint32_t *returned)
+{
+	(void)file;
+	(void)in_size;
+	tt_ioctls++;
+	*returned = 0;
+	if (code == PANWIN_IOCTL_GET_INFO && out_size == sizeof(struct panwin_info)) {
+		struct panwin_info *i = buf;
+		memset(i, 0, sizeof(*i));
+		i->abi_version = (uint32_t)tt_abi;
+		*returned = sizeof(*i);
+		return 0;
+	}
+	if (code == PANWIN_IOCTL_DRM(_IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT)))
+		return PANWIN_STATUS_FROM_ERRNO(110); /* ETIMEDOUT, not ETIME */
+	return (int32_t)0xC0000010u; /* STATUS_INVALID_DEVICE_REQUEST: unknown ioctl */
+}
+static void *tt_os_handle(void *file) { return file; }
+
+static const struct panwin_transport tt_transport = {
+	.version = PANWIN_TRANSPORT_VERSION, .name = "test", .enumerate = tt_enumerate,
+	.device_path = tt_device_path, .open = tt_open, .close = tt_close, .ioctl = tt_ioctl,
+	.os_handle = tt_os_handle,
+};
+
+static void test_transports(void)
+{
+	struct panwin_transport bad = tt_transport;
+	char path[32];
+
+	bad.version = 99;
+	CHECK(panwin_register_transport(&bad) == -1 && errno == EINVAL);
+	CHECK(panwin_register_transport(&tt_transport) == 0);
+	CHECK(panwin_register_transport(&tt_transport) == -1 && errno == EEXIST);
+	CHECK(panwin_select_transport("nope") == -1 && errno == ENOENT);
+	CHECK(panwin_select_transport("dll:Z:\\nonexistent\\x.dll") == -1 && errno == ENOENT);
+	CHECK(panwin_select_transport("test") == 0);
+	CHECK(!strcmp(panwin_transport_name(), "test"));
+	CHECK(panwin_device_path(0, path, sizeof(path)) == 0 && !strcmp(path, "test:0"));
+
+	/* ABI handshake: an ABI 1 kernel is refused unless the caller opts out. */
+	tt_abi = 1;
+	CHECK(panwin_open("/dev/dri/renderD128", 0) == -1 && errno == EPROTO);
+	int fd = panwin_open("/dev/dri/renderD128", PANWIN_O_NOABICHECK);
+	CHECK(fd >= 0);
+	CHECK(panwin_select_transport("fake") == -1 && errno == EBUSY);
+	CHECK(panwin_close(fd) == 0);
+	tt_abi = PANWIN_ABI_VERSION;
+	fd = panwin_open("/dev/dri/renderD128", 0);
+	CHECK(fd >= 0);
+	if (fd >= 0) {
+		uint32_t h = 1;
+		struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ };
+		int before = tt_ioctls;
+		CHECK(drmSyncobjWait(fd, &h, 1, 0, 0, NULL) == -ETIMEDOUT);
+		CHECK(drmIoctl(fd, DRM_IOCTL_GET_CAP, &cap) == -1 && errno == ENOTTY);
+		CHECK(tt_ioctls == before + 2);
+		CHECK(panwin_close(fd) == 0);
+	}
+	/* PANWIN_TRANSPORT=dll:<path> loader (meson passes the test DLL's path). */
+	char dll[600], sel[620];
+	DWORD n = GetEnvironmentVariableA("PANWIN_TEST_TRANSPORT_DLL", dll, sizeof(dll));
+	if (n > 0 && n < sizeof(dll)) {
+		snprintf(sel, sizeof(sel), "dll:%s", dll);
+		CHECK(panwin_select_transport(sel) == 0);
+		CHECK(!strcmp(panwin_transport_name(), "testdll"));
+		fd = panwin_open("/dev/dri/renderD128", 0); /* ABI 2 handshake through the DLL */
+		CHECK(fd >= 0);
+		if (fd >= 0) {
+			struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ };
+			CHECK(drmIoctl(fd, DRM_IOCTL_GET_CAP, &cap) == -1 && errno == ENOSYS);
+			CHECK(panwin_close(fd) == 0);
+		}
+		CHECK(panwin_select_transport(sel) == 0); /* already registered: reused */
+		CHECK(panwin_select_transport("testdll") == 0);
+	} else {
+		printf("note: PANWIN_TEST_TRANSPORT_DLL not set, dll: loader not tested\n");
+	}
+	CHECK(panwin_select_transport("fake") == 0);
+	CHECK(!strcmp(panwin_transport_name(), "fake"));
+}
+
 int main(void)
 {
 	printf("transport: %s\n", panwin_transport_name());
@@ -392,6 +512,7 @@ int main(void)
 	}
 	test_mapping_lifetime();
 	test_fd_exhaustion();
+	test_transports();
 
 	printf("%s: %d checks, %d failures\n", failures ? "FAILED" : "OK", checks, failures);
 	return failures ? 1 : 0;

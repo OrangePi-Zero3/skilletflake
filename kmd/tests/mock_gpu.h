@@ -73,6 +73,10 @@ struct mock_config {
 	/* GPU RAWSTAT reads from non-IRQ threads don't show RESET_COMPLETED/CLEAN_CACHES_COMPLETED,
 	 * forcing completion through the GPU bottom half. */
 	bool hide_completions_from_waiters;
+	/* (e2e) Honour PW_MEM_ZEROED (pw_os.h: such pages must read as zero). Off by default so
+	 * the host tests keep their 0xa5 poison everywhere; libdrm-win's core transport turns it
+	 * on because userspace (Mesa) relies on zeroed BOs, as on Linux. */
+	bool honor_zeroed;
 };
 
 struct mock_as_state {
@@ -129,8 +133,57 @@ int mock_gpu_translate(struct pw_os *os, unsigned int as, uint64_t va, char acce
 		       int *level, uint64_t *pte);
 /* Read GPU-visible bytes at a VA through AS @as. Returns 0 or the fault code. */
 int mock_gpu_read(struct pw_os *os, unsigned int as, uint64_t va, void *buf, size_t len);
+/* Write GPU-visible bytes at a VA through AS @as. Returns 0 or the fault code. */
+int mock_gpu_write(struct pw_os *os, unsigned int as, uint64_t va, const void *buf, size_t len);
 /* Host pointer to the "DRAM" byte at @pa (NULL if not allocated). */
 uint8_t *mock_pa_to_host(struct pw_os *os, uint64_t pa);
+/* (e2e) CPU view backing a user mapping (mmap) of @mem: the GPU ("DRAM") bytes themselves for
+ * PW_MEM_UNCACHED memory, a CPU-cache view kept coherent only by pw_os_mem_flush()/
+ * pw_os_mem_invalidate() otherwise. Page aligned, valid until pw_os_mem_free(). */
+void *mock_mem_user_view(struct pw_os *os, struct pw_os_mem *mem);
+/* (e2e) One user mapping of the whole of @mem, released with mock_mem_user_unmap(). On Windows
+ * uncached memory gets a distinct view of the same pages per call (read-only unless @writable),
+ * like a real user mapping; otherwise this is mock_mem_user_view() and unmap is a no-op. */
+void *mock_mem_user_map(struct pw_os *os, struct pw_os_mem *mem, bool writable);
+void mock_mem_user_unmap(struct pw_os *os, struct pw_os_mem *mem, void *view);
+
+/*
+ * CSF command-stream executor (mock_csf.c). The emulated MCU acts on CSG/CS requests (START,
+ * TERMINATE/SUSPEND, ENDPOINT_CONFIG, STATUS_UPDATE, doorbell_req) and, on a CS doorbell,
+ * executes the ring buffer from extract to insert through the group's AS: MOVE48/32, ADD_IMM,
+ * LOAD/STORE_MULTIPLE, BRANCH, CALL/JUMP (depth 8), SYNC_ADD/SET 32/64, SYNC_WAIT32/64
+ * (blocks the CS until satisfied, re-evaluated whenever a CS writes memory or on
+ * mock_csf_kick()), HEAP_SET, STORE_STATE, FLUSH_CACHE2/WAIT/ERROR_BARRIER/NOP and the RUN_xxx and
+ * FINISH_xxx work instructions (no-ops, counted). Anything else raises CS_FATAL
+ * (CS_INSTR_INVALID); GPU faults raise CS_FATAL (CS_BUS_FAULT). Sync operations raise CSG
+ * SYNC_UPDATE. Execution is synchronous inside the doorbell register write.
+ */
+struct mock_cs_stats {
+	bool started;			/* CS_STATE_START acked */
+	bool fatal;
+	bool blocked_sync;		/* waiting in SYNC_WAIT */
+	bool blocked_oom;		/* waiting for the host to handle TILER_OOM */
+	uint32_t as;			/* AS of the CSG (CSG config) */
+	uint32_t doorbell;		/* CS_CONFIG doorbell id */
+	uint32_t priority;		/* CS_CONFIG priority */
+	uint64_t extract;		/* ring-buffer extract (linear) */
+	uint64_t instrs, runs, flushes, calls, syncs, waits, doorbells;
+	uint32_t fatal_type;		/* CS_FATAL exception type */
+	uint64_t ringbuf_base;
+	uint32_t ringbuf_size;
+};
+void mock_csf_cs_stats(struct pw_os *os, unsigned int csg, unsigned int cs,
+		       struct mock_cs_stats *st);
+/* CSG slot state: 0 idle/terminated, 1 running; *ep_req = endpoint_req as programmed. */
+bool mock_csf_csg_running(struct pw_os *os, unsigned int csg, uint64_t *ep_req);
+/* Re-evaluate blocked SYNC_WAITs (e.g. after the test wrote GPU memory with the CPU). */
+void mock_csf_kick(struct pw_os *os);
+/* The next @count RUN_TILING/RUN_IDVS instructions raise TILER_OOM with the HEAP_SET context
+ * address and these counters; the CS resumes once the host acked it and rang the CSG doorbell. */
+void mock_csf_inject_tiler_oom(struct pw_os *os, uint32_t count, uint32_t vt_start,
+			       uint32_t vt_end, uint32_t frag_end);
+/* Number of TILER_OOM events the host handled; heap_start/heap_end it gave for the last one. */
+uint32_t mock_csf_oom_handled(struct pw_os *os, uint64_t *heap_start, uint64_t *heap_end);
 
 /* Logging captured from pw_os_log (all levels). */
 bool mock_log_contains(struct pw_os *os, const char *needle);

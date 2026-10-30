@@ -13,27 +13,128 @@
 #include "libdrm_win.h"
 #include "pw_internal.h"
 
-/* ---- transport selection ---- */
+/* ---- transport registry and selection ---- */
 
-static SRWLOCK fd_lock = SRWLOCK_INIT;      /* protects fds[], open_count, g_tp */
+#define PW_MAX_TRANSPORTS 8
+
+static SRWLOCK fd_lock = SRWLOCK_INIT;      /* protects fds[], open_count, g_tp, transports[] */
 static struct pw_file *fds[PANWIN_FD_MAX];
 static int open_count;                      /* live pw_file objects (fds + mappings) */
-static const struct pw_transport *g_tp;
-
-static const struct pw_transport *select_default_transport(void)
-{
+static const struct panwin_transport *g_tp;
+static const struct panwin_transport *transports[PW_MAX_TRANSPORTS] = {
+	&pw_transport_win32,
 #ifdef PANWIN_HAVE_FAKE_KERNEL
-	char v[8];
-	DWORD n = GetEnvironmentVariableA("PANWIN_FAKE_KERNEL", v, sizeof(v));
+	&pw_transport_fake,
+#endif
+#ifdef PANWIN_HAVE_CORE_TRANSPORT
+	&pw_transport_core,
+#endif
+};
+
+static bool transport_valid(const struct panwin_transport *tp)
+{
+	return tp && tp->version == PANWIN_TRANSPORT_VERSION && tp->name && tp->name[0] &&
+	       tp->enumerate && tp->device_path && tp->open && tp->close && tp->ioctl && tp->os_handle;
+}
+
+/* Caller holds fd_lock (shared or exclusive). */
+static const struct panwin_transport *find_transport_locked(const char *name)
+{
+	for (int i = 0; i < PW_MAX_TRANSPORTS && transports[i]; i++)
+		if (!strcmp(transports[i]->name, name))
+			return transports[i];
+	return NULL;
+}
+
+int panwin_register_transport(const struct panwin_transport *tp)
+{
+	int r = 0;
+
+	if (!transport_valid(tp)) {
+		errno = EINVAL;
+		return -1;
+	}
+	AcquireSRWLockExclusive(&fd_lock);
+	if (find_transport_locked(tp->name)) {
+		r = EEXIST;
+	} else {
+		r = ENOSPC;
+		for (int i = 0; i < PW_MAX_TRANSPORTS; i++) {
+			if (!transports[i]) {
+				transports[i] = tp;
+				r = 0;
+				break;
+			}
+		}
+	}
+	ReleaseSRWLockExclusive(&fd_lock);
+	if (r) {
+		errno = r;
+		return -1;
+	}
+	return 0;
+}
+
+/* "dll:<path>": load a transport DLL and register what its entry point returns. */
+static const struct panwin_transport *load_transport_dll(const char *path)
+{
+	HMODULE m = LoadLibraryA(path);
+	panwin_transport_entry_fn entry;
+	const struct panwin_transport *tp;
+
+	if (!m)
+		return NULL;
+	entry = (panwin_transport_entry_fn)(void (*)(void))GetProcAddress(m, PANWIN_TRANSPORT_ENTRY);
+	tp = entry ? entry() : NULL;
+	if (!transport_valid(tp)) {
+		FreeLibrary(m);
+		return NULL;
+	}
+	/* The DLL stays loaded for the life of the process (the table lives in it). */
+	if (panwin_register_transport(tp) && errno != EEXIST)
+		return NULL;
+	AcquireSRWLockShared(&fd_lock);
+	tp = find_transport_locked(tp->name);
+	ReleaseSRWLockShared(&fd_lock);
+	return tp;
+}
+
+static const struct panwin_transport *lookup_transport(const char *name)
+{
+	const struct panwin_transport *tp;
+
+	if (!strncmp(name, "dll:", 4))
+		return load_transport_dll(name + 4);
+	AcquireSRWLockShared(&fd_lock);
+	tp = find_transport_locked(name);
+	ReleaseSRWLockShared(&fd_lock);
+	return tp;
+}
+
+static const struct panwin_transport *select_default_transport(void)
+{
+	char v[MAX_PATH + 8];
+	DWORD n = GetEnvironmentVariableA("PANWIN_TRANSPORT", v, sizeof(v));
+	const struct panwin_transport *tp;
+
+	if (n > 0 && n < sizeof(v)) {
+		tp = lookup_transport(v);
+		if (tp)
+			return tp;
+		fprintf(stderr, "libdrm-win: PANWIN_TRANSPORT=%s: no such transport, using \"real\"\n", v);
+		return &pw_transport_win32;
+	}
+#ifdef PANWIN_HAVE_FAKE_KERNEL
+	n = GetEnvironmentVariableA("PANWIN_FAKE_KERNEL", v, sizeof(v));
 	if (n > 0 && n < sizeof(v) && v[0] != '0')
 		return &pw_transport_fake;
 #endif
 	return &pw_transport_win32;
 }
 
-const struct pw_transport *pw_transport(void)
+const struct panwin_transport *pw_transport(void)
 {
-	const struct pw_transport *tp;
+	const struct panwin_transport *tp;
 
 	AcquireSRWLockShared(&fd_lock);
 	tp = g_tp;
@@ -41,31 +142,43 @@ const struct pw_transport *pw_transport(void)
 	if (tp)
 		return tp;
 
+	tp = select_default_transport(); /* may load a DLL: not under fd_lock */
 	AcquireSRWLockExclusive(&fd_lock);
 	if (!g_tp)
-		g_tp = select_default_transport();
+		g_tp = tp;
 	tp = g_tp;
 	ReleaseSRWLockExclusive(&fd_lock);
 	return tp;
 }
 
+int panwin_select_transport(const char *name)
+{
+	const struct panwin_transport *tp = name ? lookup_transport(name) : NULL;
+	int r = 0;
+
+	if (!tp) {
+		errno = ENOENT;
+		return -1;
+	}
+	AcquireSRWLockExclusive(&fd_lock);
+	if (open_count && g_tp != tp)
+		r = EBUSY;
+	else
+		g_tp = tp;
+	ReleaseSRWLockExclusive(&fd_lock);
+	if (r) {
+		errno = r;
+		return -1;
+	}
+	return 0;
+}
+
 int panwin_use_fake_kernel(int enable)
 {
 #ifdef PANWIN_HAVE_FAKE_KERNEL
-	int r = 0;
-	AcquireSRWLockExclusive(&fd_lock);
-	if (open_count) {
-		r = -1;
-	} else {
-		g_tp = enable ? &pw_transport_fake : &pw_transport_win32;
-	}
-	ReleaseSRWLockExclusive(&fd_lock);
-	if (r)
-		errno = EBUSY;
-	return r;
+	return panwin_select_transport(enable ? "fake" : "real");
 #else
 	(void)enable;
-	(void)open_count; /* only consulted when the fake transport exists */
 	errno = ENOSYS;
 	return -1;
 #endif
@@ -73,7 +186,7 @@ int panwin_use_fake_kernel(int enable)
 
 int panwin_device_path(int index, char *buf, size_t len)
 {
-	const struct pw_transport *tp = pw_transport();
+	const struct panwin_transport *tp = pw_transport();
 	int r;
 
 	tp->enumerate();
@@ -206,13 +319,32 @@ static int fd_install(struct pw_file *f)
 	return fd;
 }
 
+/* ABI handshake: the kernel's GET_INFO must report this build's PANWIN_ABI_VERSION. */
+static int check_abi(const struct panwin_transport *tp, void *tfile)
+{
+	struct panwin_info info;
+	uint32_t returned = 0;
+	int r;
+
+	memset(&info, 0, sizeof(info));
+	r = pw_ioctl_status_to_errno(tp->ioctl(tfile, PANWIN_IOCTL_GET_INFO, &info, sizeof(info),
+					       sizeof(info), &returned));
+	if (r)
+		return r;
+	if (returned < sizeof(info.abi_version) || info.abi_version != PANWIN_ABI_VERSION) {
+		fprintf(stderr, "libdrm-win: panwin.sys ABI %u, this libdrm.dll needs ABI %u\n",
+			info.abi_version, PANWIN_ABI_VERSION);
+		return EPROTO;
+	}
+	return 0;
+}
+
 int panwin_open(const char *path, int flags)
 {
-	const struct pw_transport *tp = pw_transport();
+	const struct panwin_transport *tp = pw_transport();
 	struct pw_file *f;
 	int index, type, r, fd;
 
-	(void)flags;
 	if (pw_parse_node(path, &index, &type)) {
 		errno = ENOENT;
 		return -1;
@@ -227,6 +359,15 @@ int panwin_open(const char *path, int flags)
 		free(f);
 		errno = -r;
 		return -1;
+	}
+	if (!(flags & PANWIN_O_NOABICHECK)) {
+		r = check_abi(tp, f->tfile);
+		if (r) {
+			tp->close(f->tfile);
+			free(f);
+			errno = r;
+			return -1;
+		}
 	}
 	f->tp = tp;
 	f->index = index;
@@ -306,10 +447,10 @@ int pw_fd_ioctl(int fd, uint32_t code, void *buf, uint32_t in_size, uint32_t out
 
 	if (!f)
 		return -1;
-	r = f->tp->ioctl(f->tfile, code, buf, in_size, out_size, &returned);
+	r = pw_ioctl_status_to_errno(f->tp->ioctl(f->tfile, code, buf, in_size, out_size, &returned));
 	pw_file_put(f);
 	if (r) {
-		errno = -r;
+		errno = r;
 		return -1;
 	}
 	return 0;
@@ -323,14 +464,27 @@ int panwin_private_ioctl(int fd, uint32_t code, void *buf, uint32_t size)
 int panwin_syncobj_event(int fd, uint32_t handle, uint64_t point, uint32_t flags, void **event)
 {
 	struct panwin_syncobj_event ev = { .handle = handle, .flags = flags, .point = point };
+	HANDLE h;
 
 	if (!event) {
 		errno = EINVAL;
 		return -1;
 	}
-	if (pw_fd_ioctl(fd, PANWIN_IOCTL_SYNCOBJ_EVENT, &ev, sizeof(ev), sizeof(ev)))
+	/* ABI v2: the caller creates the event; the kernel references it by handle
+	 * (EVENT_MODIFY_STATE) and sets it once. Manual-reset, so it stays signalled. */
+	h = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (!h) {
+		errno = panwin_win32_error_to_errno(GetLastError());
 		return -1;
-	*event = (void *)(uintptr_t)ev.event_handle;
+	}
+	ev.event_handle = (uint64_t)(uintptr_t)h;
+	if (pw_fd_ioctl(fd, PANWIN_IOCTL_SYNCOBJ_EVENT, &ev, sizeof(ev), 0)) {
+		int e = errno;
+		CloseHandle(h);
+		errno = e;
+		return -1;
+	}
+	*event = h;
 	return 0;
 }
 
@@ -377,10 +531,11 @@ void *panwin_mmap(int fd, uint64_t offset, size_t size, int prot)
 	m.offset = offset;
 	m.size = ((uint64_t)size + ps - 1) & ~(ps - 1);
 	m.prot = (uint32_t)prot & (PANWIN_PROT_READ | PANWIN_PROT_WRITE);
-	r = f->tp->ioctl(f->tfile, PANWIN_IOCTL_MMAP, &m, sizeof(m), sizeof(m), &returned);
-	if (r || !m.user_va) {
+	r = pw_ioctl_status_to_errno(f->tp->ioctl(f->tfile, PANWIN_IOCTL_MMAP, &m, sizeof(m),
+						  sizeof(m), &returned));
+	if (r || returned != sizeof(m) || !m.user_va) {
 		pw_file_put(f);
-		errno = r ? -r : EIO;
+		errno = r ? r : EIO;
 		return NULL;
 	}
 
@@ -432,10 +587,11 @@ int panwin_munmap(void *ptr, size_t size)
 	}
 
 	struct panwin_munmap um = { .user_va = (uint64_t)(uintptr_t)mp.va, .size = mp.size };
-	r = mp.f->tp->ioctl(mp.f->tfile, PANWIN_IOCTL_MUNMAP, &um, sizeof(um), 0, &returned);
+	r = pw_ioctl_status_to_errno(mp.f->tp->ioctl(mp.f->tfile, PANWIN_IOCTL_MUNMAP, &um,
+						     sizeof(um), 0, &returned));
 	pw_file_put(mp.f);
 	if (r) {
-		errno = -r;
+		errno = r;
 		return -1;
 	}
 	return 0;

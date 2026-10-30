@@ -74,6 +74,9 @@ struct pw_vm {
 	bool for_mcu;
 	int as;				/* AS slot, -1 when not active; under mmu.slots_lock */
 	bool unhandled_fault;
+	/* (added by core-mem) Number of unhandled faults ever reported on this VM; never reset
+	 * (pw_vm_activate() clears unhandled_fault). __atomic. pw_uvm_is_unusable() reads it. */
+	uint32_t fault_count;
 	struct {
 		uint64_t start, size;
 	} locked;

@@ -118,7 +118,15 @@ struct pw_fw {
 	struct pw_fw_csg_iface csg[MAX_CSGS];
 	struct pw_fw_cs_iface cs[MAX_CSGS][MAX_CS_PER_CSG];
 	uint32_t timer_hz;
+
+	/* (added by core-sched) MCU-VM kernel VA allocator: kernel objects the FW must see (queue
+	 * ring-buffer interfaces, CSG suspend buffers) are mapped in the MCU VM's kernel range,
+	 * [CSF_MCU_SHARED_REGION_START, +SIZE) minus the FW sections (fw.c:1525). */
+	struct pw_os_mutex *kva_lock;
+	struct pw_fw_kva *kva_list;	/* sorted by VA, under kva_lock */
 };
+
+struct pw_sched;
 
 struct pw_device {
 	struct pw_os *os;
@@ -134,6 +142,7 @@ struct pw_device {
 	struct pw_gpu gpu;
 	struct pw_mmu mmu;
 	struct pw_fw fw;
+	struct pw_sched *sched;		/* (added by core-sched) NULL until pw_sched_init(); __atomic */
 };
 
 /* ---- register access (all GPU registers are 32-bit; 64-bit ones are LO/HI pairs) ---- */
@@ -224,6 +233,13 @@ void pw_fw_ring_doorbell(struct pw_device *dev, uint32_t id);
 void pw_fw_ring_csg_doorbells(struct pw_device *dev, uint32_t csg_mask);
 int  pw_fw_ping(struct pw_device *dev, uint32_t timeout_ms);
 uint32_t pw_fw_conv_timeout(uint32_t timer_hz, uint32_t timeout_us);
+/* (added by core-sched) Map @size bytes of @mem (page aligned, PW_VM_MAP_* @map_flags) at a free
+ * MCU VA of the MCU VM's kernel range (PANTHOR_VM_KERNEL_AUTO_VA on ptdev->fw->vm). PW_EINVAL
+ * without a booted FW, PW_ENOMEM when the range is full. */
+int  pw_fw_map_kernel_mem(struct pw_device *dev, struct pw_os_mem *mem, uint64_t size,
+			  uint32_t map_flags, uint32_t *mcu_va);
+/* Undo pw_fw_map_kernel_mem(); unknown VAs are ignored. */
+void pw_fw_unmap_kernel_mem(struct pw_device *dev, uint32_t mcu_va);
 
 /* req/ack helpers (panthor_fw.h:452-510). Must be called with fw.req_lock held. */
 static inline uint32_t pw_fw_toggle_val(uint32_t cur_req, uint32_t ack, uint32_t mask)
