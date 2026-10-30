@@ -54,11 +54,13 @@ if with_core
   # The core's own source list (kmd/core/meson.build) plus the host-test mock.
   pw_core_files = []
   foreach f : ['pw_bo.c', 'pw_device.c', 'pw_file.c', 'pw_fw.c', 'pw_gpu.c', 'pw_handle.c',
-               'pw_heap.c', 'pw_irq.c', 'pw_mmu.c', 'pw_sched.c', 'pw_sync.c', 'pw_util.c']
+               'pw_heap.c', 'pw_irq.c', 'pw_jm_hw.c', 'pw_jm_mem.c', 'pw_jm_sched.c', 'pw_mmu.c',
+               'pw_sched.c', 'pw_sync.c', 'pw_util.c']
     pw_core_files += files('../../kmd/core' / f)
   endforeach
   pwcore = static_library('pwcore_mock',
-    pw_core_files, files('../../kmd/tests/pw_os_mock.c', '../../kmd/tests/mock_csf.c'),
+    pw_core_files, files('../../kmd/tests/pw_os_mock.c', '../../kmd/tests/mock_csf.c',
+                         '../../kmd/tests/mock_jm.c'),
     include_directories : include_directories('../../kmd/core', '../../kmd/tests', '../../include',
                                               '../../include/drm-uapi', '../../include/compat'),
     c_args : ['-mno-ms-bitfields', '-D_GNU_SOURCE'],

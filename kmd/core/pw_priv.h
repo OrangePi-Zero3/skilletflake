@@ -10,6 +10,7 @@
 #include "pw_fw_iface.h"
 #include "pw_regs_fw.h"
 #include "pw_regs_gpu.h"
+#include "pw_regs_jm.h"
 #include "pw_regs_mmu.h"
 #include "pw_util.h"
 
@@ -127,6 +128,9 @@ struct pw_fw {
 };
 
 struct pw_sched;
+struct pw_jm_hw;
+struct pw_jm_mem;
+struct pw_jm_sched;
 
 struct pw_device {
 	struct pw_os *os;
@@ -143,6 +147,13 @@ struct pw_device {
 	struct pw_mmu mmu;
 	struct pw_fw fw;
 	struct pw_sched *sched;		/* (added by core-sched) NULL until pw_sched_init(); __atomic */
+
+	/* (added by jm-arch) Backend chosen by pw_gpu_init() from GPU_ID; constant afterwards.
+	 * On PW_BACKEND_JM, fw/sched/csif_info stay unused and the three JM modules own: */
+	enum pw_backend backend;
+	struct pw_jm_hw *jm;		/* pw_jm_hw.c: JM GPU state, job slots, AS LRU */
+	struct pw_jm_mem *jm_mem;	/* pw_jm_mem.c: device-level memory state */
+	struct pw_jm_sched *jm_sched;	/* pw_jm_sched.c: slot queues, timeouts, reset */
 };
 
 /* ---- register access (all GPU registers are 32-bit; 64-bit ones are LO/HI pairs) ---- */

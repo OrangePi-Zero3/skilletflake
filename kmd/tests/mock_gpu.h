@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * mock_gpu.h - host test double for pw_os.h: a mock MMIO register file with a small behavioural
- * model of an RK3588 Mali-G610 (CSF), fake physical memory with a separate "DRAM" and "CPU
- * cache" view for cached mappings (so missing pw_os_mem_flush() calls are visible to the
- * emulated GPU), an independent AArch64 page-table walker, and an emulated MCU.
+ * model of an RK3588 Mali-G610 (CSF) or (jm-arch) an Orange Pi Zero3 Mali-G31 MP2 (job manager),
+ * fake physical memory with a separate "DRAM" and "CPU cache" view for cached mappings (so
+ * missing pw_os_mem_flush() calls are visible to the emulated GPU), an independent AArch64
+ * page-table walker, an emulated MCU (G610) and a job-chain executor (G31, mock_jm.c).
  */
 #ifndef MOCK_GPU_H
 #define MOCK_GPU_H
@@ -35,6 +36,55 @@ struct pw_device;
 #define MOCK_G610_L2_PRESENT		1ull
 #define MOCK_G610_TILER_PRESENT		1ull
 
+/*
+ * (jm-arch) G31 MP2 values (Orange Pi Zero3, Allwinner H618). Sources and confidence, to be
+ * confirmed with panwin-info / a Linux panfrost boot log on the board (docs/status/jm-arch.md):
+ *  GPU_ID 0x7093 << 16: arch 7.0 rev 9, product 3 = G31 (Mesa pan_model.c PAN_PROD_ID(7, 0, 3);
+ *    Linux panfrost matches 0x7003 ignoring the arch-rev nibble). The 0x7093 / r0p0 / status 0
+ *    values are what public panfrost boot logs of G31 boards print: RECALLED, not dumped here.
+ *  L2 0x07110206, core 0x2, tiler 0x209, mem 0x1, AS 0xff, JS 0x7, shader_present 0x3,
+ *    l2_present 0x1: same recalled boot-log line ("Features: L2:... AS:0xff JS:0x7"). GUESSES
+ *    until read on the board.
+ *  MMU 0x2830 (48-bit VA, 40-bit PA): GUESS (Mesa's drm-shim default for most hardware is
+ *    0x00280030; a 0x2823 / 35-bit VA G31 would also work with the core, which needs >= 33).
+ *  Threads: 512 max threads / workgroup / barrier (Mesa: "G31 is 512"), THREAD_FEATURES with
+ *    16384 registers (512 * 32) and 2 tasks, TLS_ALLOC 512: GUESSES.
+ *  JS_FEATURES 0x20e (JS0: null, set-value, cache-flush, fragment), 0x1fe (JS1: everything but
+ *    fragment), 0x7e (JS2: compute-type jobs): the common kbase/panfrost layout, GUESSES.
+ *  Texture features: the G610 dump (Mesa only uses them for format support): GUESS.
+ *  Coherency features 0x1 (ACE-Lite only; the H616 integration is non-coherent anyway): GUESS.
+ *  STACK_PRESENT 0x1, AFBC_FEATURES 0: GUESSES.
+ */
+#define MOCK_G31_GPU_ID			0x70930000u
+#define MOCK_G31_L2_FEATURES		0x07110206u
+#define MOCK_G31_CORE_FEATURES		0x2u
+#define MOCK_G31_TILER_FEATURES		0x209u
+#define MOCK_G31_MEM_FEATURES		0x1u
+#define MOCK_G31_MMU_FEATURES		0x2830u
+#define MOCK_G31_AS_PRESENT		0xffu
+#define MOCK_G31_JS_PRESENT		0x7u
+#define MOCK_G31_JS0_FEATURES		0x20eu
+#define MOCK_G31_JS1_FEATURES		0x1feu
+#define MOCK_G31_JS2_FEATURES		0x7eu
+#define MOCK_G31_THREAD_FEATURES	0x02004000u
+#define MOCK_G31_MAX_THREADS		512u
+#define MOCK_G31_MAX_WG_SIZE		512u
+#define MOCK_G31_MAX_BARRIER		512u
+#define MOCK_G31_THREAD_TLS_ALLOC	512u
+#define MOCK_G31_TEXTURE_FEATURES0	MOCK_G610_TEXTURE_FEATURES0
+#define MOCK_G31_COHERENCY_FEATURES	0x1u
+#define MOCK_G31_AFBC_FEATURES		0x0u
+#define MOCK_G31_SHADER_PRESENT		0x3ull
+#define MOCK_G31_L2_PRESENT		1ull
+#define MOCK_G31_TILER_PRESENT		1ull
+#define MOCK_G31_STACK_PRESENT		1ull
+
+/* Which GPU the mock models. G610 is the default (all pre-JM tests). */
+enum mock_model {
+	MOCK_MODEL_G610 = 0,		/* RK3588, CSF: MCU + command-stream executor (mock_csf.c) */
+	MOCK_MODEL_G31,			/* H618, job manager: job slots + executor (mock_jm.c) */
+};
+
 /* Emulated FW interface (plausible, not dumped from hardware). */
 #define MOCK_FW_IFACE_VERSION		((1u << 24) | (1u << 16) | 0u)	/* v1.1.0 */
 #define MOCK_FW_GROUP_NUM		8u
@@ -55,7 +105,9 @@ enum mock_fw_variant {
 };
 
 struct mock_config {
-	uint32_t gpu_id;		/* 0 = G610 default */
+	enum mock_model model;		/* (jm-arch) register set and command model */
+	uint32_t gpu_id;		/* 0 = the model's GPU_ID */
+	uint32_t as_present;		/* (jm-arch) 0 = the model's AS_PRESENT (LRU tests) */
 	bool gpu_id_zero;		/* GPU_ID reads 0 */
 	bool no_reset_complete;		/* soft reset never raises RESET_COMPLETED */
 	bool no_l2_ready;		/* L2_READY never sets */
@@ -184,6 +236,25 @@ void mock_csf_inject_tiler_oom(struct pw_os *os, uint32_t count, uint32_t vt_sta
 			       uint32_t vt_end, uint32_t frag_end);
 /* Number of TILER_OOM events the host handled; heap_start/heap_end it gave for the last one. */
 uint32_t mock_csf_oom_handled(struct pw_os *os, uint64_t *heap_start, uint64_t *heap_end);
+
+/*
+ * (jm-arch) Job-manager executor (mock_jm.c, G31 model only). PLACEHOLDER: the register
+ * hooks exist, the executor does not yet (owner: jm-hw, docs/status/jm-arch.md). Intended
+ * model: JS_COMMAND_NEXT = START latches HEAD/AFFINITY/CONFIG_NEXT into the slot; the job chain
+ * at HEAD is walked through the AS in CONFIG (Mesa genxml v7.xml job header: type, next, and
+ * for WRITE_VALUE/NULL/CACHE_FLUSH their payloads; other job types complete without executing
+ * shaders), then JOB_INT DONE(js) or ERR(js) with JS_STATUS set; SOFT/HARD_STOP honoured,
+ * JS_STATE tracked; GPU faults raise MMU faults like the CSF executor.
+ */
+struct mock_js_stats {
+	uint32_t starts;		/* JS_COMMAND_NEXT = START latched */
+	uint32_t done, failed, stopped;
+	uint64_t last_head;		/* HEAD of the last started chain */
+	uint32_t last_config;		/* CONFIG of the last started chain */
+	uint32_t last_status;		/* JS_STATUS after it */
+	uint64_t jobs;			/* job descriptors walked */
+};
+void mock_jm_js_stats(struct pw_os *os, unsigned int js, struct mock_js_stats *st);
 
 /* Logging captured from pw_os_log (all levels). */
 bool mock_log_contains(struct pw_os *os, const char *needle);

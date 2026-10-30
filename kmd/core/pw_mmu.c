@@ -13,6 +13,7 @@
  * GPL-2.0/MIT, used under MIT; Copyright 2019 Linaro Ltd, 2023 Collabora ltd.).
  */
 
+#include "pw_jm_mem.h"
 #include "pw_mmu.h"
 
 #define PW_AS_TIMEOUT_US	100000	/* mmu.c:546 */
@@ -587,6 +588,57 @@ int pw_vm_as(struct pw_vm *vm)
 	return vm->as;
 }
 
+/* (jm-arch) pw_mmu.h. Same programming as pw_vm_activate(), without its slot policy. */
+int pw_mmu_as_bind_locked(struct pw_vm *vm, uint32_t as)
+{
+	struct pw_device *dev = vm->dev;
+	struct pw_mmu *mmu = &dev->mmu;
+	uint32_t present = dev->gpu_info.as_present & PW_GENMASK(PW_MAX_AS - 1, 0);
+	int ret;
+
+	if (!mmu->ready)
+		return PW_EBUSY;
+	if (as >= PW_MAX_AS || !(present & PW_BIT(as)))
+		return PW_EINVAL;
+	if (vm->as >= 0 && vm->as != (int)as)
+		return PW_EINVAL;
+	if (mmu->slots[as] && mmu->slots[as] != vm)
+		return PW_EINVAL;
+	if (vm->as == (int)as && !(mmu->faulty_mask & PW_BIT(as)))
+		return PW_OK;
+
+	vm->as = (int)as;
+	mmu->alloc_mask |= PW_BIT(as);
+	mmu->slots[as] = vm;
+	vm->unhandled_fault = false;
+	if (mmu->faulty_mask & PW_BIT(as)) {
+		gpu_write(dev, MMU_INT_BASE + INT_CLEAR, MMU_INT_AS_FAULT(as));
+		mmu->faulty_mask &= ~PW_BIT(as);
+	}
+	ret = as_enable(dev, as, vm->root->pa, pw_vm_transcfg(vm), mmu->memattr);
+	if (ret) {
+		pw_err(dev, "AS%u: enable failed (%d)", as, ret);
+		vm_release_as_locked(vm);
+	}
+	return ret;
+}
+
+void pw_mmu_as_unbind_locked(struct pw_vm *vm)
+{
+	struct pw_mmu *mmu = &vm->dev->mmu;
+	int ret;
+
+	if (vm->as < 0)
+		return;
+	ret = as_disable(vm->dev, (uint32_t)vm->as, false);
+	if (ret)
+		pw_err(vm->dev, "AS%d: disable failed (%d)", vm->as, ret);
+	mmu->faulty_mask &= ~PW_BIT(vm->as);
+	vm_release_as_locked(vm);
+	vm->locked.start = 0;
+	vm->locked.size = 0;
+}
+
 /* mmu.c:1776-1825, minus the remap-union logic (no VM_BIND remaps yet). op_lock held. */
 static int vm_lock_region(struct pw_vm *vm, uint64_t start, uint64_t size)
 {
@@ -859,6 +911,16 @@ void pw_mmu_irq_handler(struct pw_device *dev, uint32_t status)
 		uint32_t access_type = (fault_status >> 8) & 0x3;
 		uint32_t source_id = AS_FAULTSTATUS_SOURCE_ID(fault_status);
 		struct pw_vm *vm;
+
+		/* (jm-arch) JM: growable (HEAP) BOs are populated on fault, from this bottom half,
+		 * without slots_lock held (growing maps pages, which takes it). PW_OK means the
+		 * pages are now mapped and the GPU retries; anything else is an unhandled fault. */
+		if (dev->backend == PW_BACKEND_JM &&
+		    pw_jm_mmu_fault(dev, as, fault_status, addr) == PW_OK) {
+			gpu_write(dev, MMU_INT_BASE + INT_CLEAR, mask);
+			status &= ~mask;
+			continue;
+		}
 
 		pw_os_mutex_lock(mmu->slots_lock);
 		mmu->faulty_mask |= mask;

@@ -41,6 +41,7 @@ struct pw_os; /* opaque, owned by the OS layer */
 #define PW_EOVERFLOW -75
 #define PW_ECANCELED -125
 #define PW_E2BIG     -7	/* added by core-mem: copy_struct_from_user()-style size checks, BO labels */
+#define PW_ENODEV   -19	/* added by jm-arch: panfrost SUBMIT with an unknown out_sync */
 
 /*
  * Execution context rules:

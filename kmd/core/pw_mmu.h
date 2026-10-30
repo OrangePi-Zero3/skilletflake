@@ -112,4 +112,29 @@ uint64_t pw_mmu_pack_region_range(uint64_t *region_start, uint64_t *size);
 const char *pw_mmu_access_type_name(uint32_t fault_status);
 int  pw_mmu_as_send_cmd(struct pw_device *dev, uint32_t as, uint32_t cmd);
 
+/* ---- additions (jm-arch) ---- */
+
+/*
+ * AS slot primitives for a backend that keeps its own slot policy: the JM LRU in pw_jm_hw.c
+ * (pw_jm_as_get). pw_vm_activate()/pw_vm_deactivate() above stay the CSF policy (AS0 = MCU,
+ * lowest free slot >= 1, PW_EBUSY when full, no eviction) and are not used on JM.
+ *
+ * Locking: the caller holds dev->mmu.slots_lock. It should also hold @vm->op_lock, taken
+ * BEFORE slots_lock (the pw_vm_activate() order), so a page-table update of @vm never straddles
+ * a binding change. Neither function takes the op_lock of any other VM, so a JM LRU may unbind
+ * an idle victim while holding only the new VM's op_lock (as panthor/panfrost do).
+ *
+ * bind: make @as translate @vm. @as must be in GPU_AS_PRESENT and either free or already @vm's.
+ *   Programs TRANSTAB/MEMATTR/TRANSCFG + UPDATE, unmasks the AS fault interrupt, and re-enables
+ *   an AS that the fault handler disabled after an unhandled fault (faulty_mask). Records the
+ *   binding (vm->as, mmu.slots[], alloc_mask). Returns PW_OK, PW_EINVAL (slot not present or
+ *   owned by another VM), PW_EBUSY (MMU not initialised), or PW_ETIMEDOUT (AS_ACTIVE stuck; @vm
+ *   is left unbound).
+ * unbind: clean+invalidate the GPU caches, unlock a pending lock region, program the AS as
+ *   UNMAPPED and release it (vm->as = -1, faulty bit cleared). No-op if @vm is unbound. Jobs
+ *   still using the AS fault: the caller makes sure the VM is idle first.
+ */
+int  pw_mmu_as_bind_locked(struct pw_vm *vm, uint32_t as);
+void pw_mmu_as_unbind_locked(struct pw_vm *vm);
+
 #endif /* PW_MMU_H */

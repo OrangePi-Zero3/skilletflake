@@ -15,12 +15,38 @@
 #define GPU_INTERRUPTS_MASK \
 	(GPU_IRQ_FAULT | GPU_IRQ_PROTM_FAULT | GPU_IRQ_RESET_COMPLETED | \
 	 GPU_IRQ_CLEAN_CACHES_COMPLETED)
+/* (jm-arch) JM: no protected-mode fault bit; MULTIPLE_FAULT instead (the error set of the Mali
+ * JM GPU_INT block). POWER_CHANGED stays masked as on CSF. */
+#define GPU_INTERRUPTS_MASK_JM \
+	(GPU_IRQ_FAULT | GPU_IRQ_MULTIPLE_FAULT | GPU_IRQ_RESET_COMPLETED | \
+	 GPU_IRQ_CLEAN_CACHES_COMPLETED)
 
 #define PW_GPU_RESET_TIMEOUT_MS		100	/* gpu.c:419 */
 #define PW_GPU_FLUSH_TIMEOUT_MS		100	/* gpu.c:363 */
 #define PW_L2_POWER_TIMEOUT_US		20000	/* gpu.c:294,322 */
 
 #define GPU_PROD_ID_MAKE(arch_major, prod_major) (((arch_major) << 24) | (prod_major))
+
+/* (jm-arch) Bifrost names: Mesa src/panfrost/model/pan_model.c (MIT), PAN_PROD_ID(arch major,
+ * arch minor, product major). Arch major + product major is unique among Bifrost parts. */
+static const char *pw_gpu_bifrost_name(uint32_t gpu_id)
+{
+	switch (GPU_PROD_ID_MAKE(GPU_ARCH_MAJOR(gpu_id), GPU_PROD_MAJOR(gpu_id))) {
+	case GPU_PROD_ID_MAKE(6, 0):
+		return "Mali-G71";
+	case GPU_PROD_ID_MAKE(6, 1):
+		return "Mali-G72";
+	case GPU_PROD_ID_MAKE(7, 0):
+		return "Mali-G51";
+	case GPU_PROD_ID_MAKE(7, 1):
+		return "Mali-G76";
+	case GPU_PROD_ID_MAKE(7, 2):
+		return "Mali-G52";
+	case GPU_PROD_ID_MAKE(7, 3):
+		return "Mali-G31";
+	}
+	return NULL;
+}
 
 /* panthor_hw.c:116-176 */
 const char *pw_gpu_model_name(const struct drm_panthor_gpu_info *info)
@@ -29,7 +55,10 @@ const char *pw_gpu_model_name(const struct drm_panthor_gpu_info *info)
 						     GPU_PROD_MAJOR(info->gpu_id));
 	const bool ray_intersection = !!(info->gpu_features & GPU_FEATURES_RAY_INTERSECTION);
 	const unsigned int cores = pw_hweight64(info->shader_present);
+	const char *bifrost = pw_gpu_bifrost_name(info->gpu_id);
 
+	if (bifrost)
+		return bifrost;
 	switch (product_id) {
 	case GPU_PROD_ID_MAKE(10, 2):
 		return "Mali-G710";
@@ -143,7 +172,8 @@ static void pw_gpu_read_info(struct pw_device *dev)
 {
 	struct drm_panthor_gpu_info *info = &dev->gpu_info;
 
-	info->csf_id = gpu_read(dev, GPU_CSF_ID);
+	/* (jm-arch) 0x1C is JS_PRESENT on JM: the JM modules read it themselves. */
+	info->csf_id = dev->backend == PW_BACKEND_CSF ? gpu_read(dev, GPU_CSF_ID) : 0;
 	info->gpu_rev = gpu_read(dev, GPU_REVID);
 	info->core_features = gpu_read(dev, GPU_CORE_FEATURES);
 	info->l2_features = gpu_read(dev, GPU_L2_FEATURES);
@@ -159,15 +189,31 @@ static void pw_gpu_read_info(struct pw_device *dev)
 		info->texture_features[i] = gpu_read(dev, GPU_TEXTURE_FEATURES(i));
 	info->as_present = gpu_read(dev, GPU_AS_PRESENT);
 	/* "Introduced in arch 11.x"; panthor reads it unconditionally (hw.c:221). */
-	info->gpu_features = gpu_read64(dev, GPU_FEATURES);
+	/* (jm-arch) 0x60 is the perf-counter base on JM: CSF only. */
+	info->gpu_features = dev->backend == PW_BACKEND_CSF ? gpu_read64(dev, GPU_FEATURES) : 0;
 	info->shader_present = gpu_read64(dev, GPU_SHADER_PRESENT);
 	info->tiler_present = gpu_read64(dev, GPU_TILER_PRESENT);
 	info->l2_present = gpu_read64(dev, GPU_L2_PRESENT);
 
 	/* panthor_gpu_coherency_init() (gpu.c:486): RK3588 is not dma-coherent (no `dma-coherent`
-	 * in rk3588-base.dtsi, _CCA 0 in edk2-rk3588), so we always select NONE. */
+	 * in rk3588-base.dtsi, _CCA 0 in edk2-rk3588), so we always select NONE. The H616 (Zero3)
+	 * is not either (_CCA 0 in firmware/zero3), same register and value on JM. */
 	dev->coherent = false;
 	info->selected_coherency = GPU_COHERENCY_NONE;
+}
+
+/* (jm-arch) Backend selection, see enum pw_backend in pw_core.h. */
+enum pw_backend pw_backend_for_gpu_id(uint32_t gpu_id)
+{
+	uint32_t arch = GPU_ARCH_MAJOR(gpu_id);
+
+	if (gpu_id == 0 || gpu_id == 0xffffffffu)
+		return PW_BACKEND_NONE;
+	if (arch == 6 || arch == 7)
+		return PW_BACKEND_JM;
+	if (arch >= 10 && arch <= 13)
+		return PW_BACKEND_CSF;
+	return PW_BACKEND_NONE;
 }
 
 int pw_gpu_init(struct pw_device *dev)
@@ -200,9 +246,11 @@ int pw_gpu_init(struct pw_device *dev)
 	gpu_write(dev, JOB_INT_BASE + INT_MASK, 0);
 	gpu_write(dev, MMU_INT_BASE + INT_MASK, 0);
 
-	/* hw.c:31-58: arch 10-13 use GPU_CONTROL power paths; 14+ needs PWR_CONTROL (not done). */
+	/* hw.c:31-58: arch 10-13 use GPU_CONTROL power paths; 14+ needs PWR_CONTROL (not done).
+	 * (jm-arch) Bifrost (6, 7) is the job-manager backend. */
 	arch = GPU_ARCH_MAJOR(id);
-	if (arch < 10 || arch > 13) {
+	dev->backend = pw_backend_for_gpu_id(id);
+	if (dev->backend == PW_BACKEND_NONE) {
 		pw_err(dev, "unsupported GPU arch %u (GPU_ID 0x%08x)", arch, id);
 		return PW_EOPNOTSUPP;
 	}
@@ -221,7 +269,8 @@ int pw_gpu_init(struct pw_device *dev)
 	if (ret)
 		return ret;
 	/* gpu.c:178-179 */
-	pw_irq_enable_events(dev, PW_IRQ_GPU, GPU_INTERRUPTS_MASK);
+	pw_irq_enable_events(dev, PW_IRQ_GPU, dev->backend == PW_BACKEND_JM ?
+			     GPU_INTERRUPTS_MASK_JM : GPU_INTERRUPTS_MASK);
 	pw_irq_resume(dev, PW_IRQ_GPU);
 	return PW_OK;
 }
@@ -334,7 +383,9 @@ int pw_gpu_soft_reset(struct pw_device *dev)
 	dev->gpu.pending_reqs |= GPU_IRQ_RESET_COMPLETED;
 	pw_os_event_reset(dev->gpu.reqs_event);
 	gpu_write(dev, GPU_INT_BASE + INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
-	gpu_write(dev, GPU_CMD, GPU_SOFT_RESET);
+	/* (jm-arch) JM GPU_CMD is a bare command number (pw_regs_jm.h). */
+	gpu_write(dev, GPU_CMD, dev->backend == PW_BACKEND_JM ? GPU_JM_CMD_SOFT_RESET :
+							      GPU_SOFT_RESET);
 	pw_os_mutex_unlock(dev->gpu.reqs_lock);
 
 	ret = pw_gpu_wait_req(dev, GPU_IRQ_RESET_COMPLETED, PW_GPU_RESET_TIMEOUT_MS);
@@ -414,6 +465,22 @@ void pw_gpu_l2_power_off(struct pw_device *dev)
 	dev->gpu.l2_on = false;
 }
 
+/*
+ * (jm-arch) GPU_CMD value for a cache flush. CSF: FLUSH_CACHES with per-cache clean/invalidate
+ * fields. JM has no per-cache control, only CLEAN_CACHES (clean L2 + LSC) and CLEAN_INV_CACHES
+ * (clean + invalidate L2 + LSC; also what panfrost's job-slot flushes use), so we pick the
+ * smallest JM command that covers the request: CLEAN_INV if anything asks for invalidation.
+ * Both raise CLEAN_CACHES_COMPLETED.
+ */
+static uint32_t pw_gpu_flush_cmd(struct pw_device *dev, uint32_t l2, uint32_t lsc, uint32_t other)
+{
+	if (dev->backend != PW_BACKEND_JM)
+		return GPU_FLUSH_CACHES(l2, lsc, other);
+	if ((l2 | lsc | other) & CACHE_INV)
+		return GPU_JM_CMD_CLEAN_INV_CACHES;
+	return GPU_JM_CMD_CLEAN_CACHES;
+}
+
 /* gpu.c:337-387 */
 int pw_gpu_flush_caches(struct pw_device *dev, uint32_t l2, uint32_t lsc, uint32_t other)
 {
@@ -430,7 +497,7 @@ int pw_gpu_flush_caches(struct pw_device *dev, uint32_t l2, uint32_t lsc, uint32
 		/* Deviation: clear a stale completion first so the RAWSTAT fast path in
 		 * pw_gpu_wait_req() can't mistake it for this flush. */
 		gpu_write(dev, GPU_INT_BASE + INT_CLEAR, GPU_IRQ_CLEAN_CACHES_COMPLETED);
-		gpu_write(dev, GPU_CMD, GPU_FLUSH_CACHES(l2, lsc, other));
+		gpu_write(dev, GPU_CMD, pw_gpu_flush_cmd(dev, l2, lsc, other));
 	}
 	pw_os_mutex_unlock(dev->gpu.reqs_lock);
 

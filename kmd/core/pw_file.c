@@ -8,9 +8,16 @@
  * 2018 Marty E. Plummer, 2019 Linaro Ltd, 2019 Collabora ltd). The DRM core behaviour (size
  * extension, VERSION's two-pass strings, GET_CAP) is re-implemented from its documented uAPI
  * semantics; no DRM core code was used. Line citations are Linux v7.3.
+ *
+ * (jm-arch) Two backends (enum pw_backend): the DRM core table is shared, the driver ioctls
+ * come from the panthor table (CSF) or the panfrost table (JM). Linux panfrost (GPL-2.0-only)
+ * was read for behaviour only (panfrost_drv.c: ioctl list, version, driver features).
  */
 
 #include "pw_bo.h"
+#include "pw_jm_hw.h"
+#include "pw_jm_mem.h"
+#include "pw_jm_sched.h"
 #include "pw_sched.h"
 #include "pw_sync.h"
 
@@ -37,6 +44,7 @@
 #define PW_DRM_NAME	"panthor"	/* Mesa's pan_kmod_drm_drv_match() looks for this */
 #define PW_DRM_DATE	"0"		/* DRM core reports "0" since driver dates were removed */
 #define PW_DRM_DESC	"Panthor DRM driver (panwin)"
+#define PW_JM_DRM_DESC	"panfrost DRM (panwin)"	/* panfrost_drv.c .desc "panfrost DRM" */
 
 #define PW_UOBJ_MAX_ARRAY_BYTES	(1u << 28)	/* sanity cap on pw_copy_obj_array() */
 
@@ -47,9 +55,61 @@ void pw_core_drm_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
 	*patch = PW_DRM_PATCH;
 }
 
+void pw_jm_drm_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
+{
+	*major = PW_JM_DRM_MAJOR;
+	*minor = PW_JM_DRM_MINOR;
+	*patch = PW_JM_DRM_PATCH;
+}
+
+static bool file_is_jm(const struct pw_file *file)
+{
+	return file->dev->backend == PW_BACKEND_JM;
+}
+
 /* ------------------------------------------------------------------------------------------ */
 /* open / close                                                                               */
 /* ------------------------------------------------------------------------------------------ */
+
+/*
+ * (jm-arch) JM file: GEM handles + mmap offsets (pw_bo.c), the file's address space (jm_mem),
+ * syncobjs, JM contexts (the default context 0 is created here, as panfrost_jm_open does).
+ */
+static int file_open_jm(struct pw_file *file)
+{
+	int ret;
+
+	ret = pw_bo_file_init(file);
+	if (ret)
+		return ret;
+	ret = pw_jm_mem_file_init(file);
+	if (ret)
+		goto err_bo;
+	ret = pw_sync_file_init(file);
+	if (ret)
+		goto err_mem;
+	ret = pw_jm_sched_file_init(file);
+	if (ret)
+		goto err_sync;
+	return PW_OK;
+
+err_sync:
+	pw_sync_file_fini(file);
+err_mem:
+	pw_jm_mem_file_fini(file);
+err_bo:
+	pw_bo_file_fini(file);
+	return ret;
+}
+
+/* Reverse of file_open_jm(): jobs hold BO, AS and fence references; BOs hold the AS. */
+static void file_close_jm(struct pw_file *file)
+{
+	pw_jm_sched_file_fini(file);
+	pw_sync_file_fini(file);
+	pw_jm_mem_file_fini(file);
+	pw_bo_file_fini(file);
+}
 
 int pw_file_open(struct pw_device *dev, struct pw_file **out)
 {
@@ -63,6 +123,13 @@ int pw_file_open(struct pw_device *dev, struct pw_file **out)
 		return PW_ENOMEM;
 	file->dev = dev;
 	file->os = dev->os;
+	if (dev->backend == PW_BACKEND_JM) {
+		ret = file_open_jm(file);
+		if (ret)
+			goto err_free;
+		*out = file;
+		return PW_OK;
+	}
 	/* drv.c:1604: DRM_PANTHOR_USER_MMIO_OFFSET of a 64-bit caller. */
 	file->user_mmio_offset = DRM_PANTHOR_USER_MMIO_OFFSET_64BIT;
 	ret = pw_bo_file_init(file);
@@ -90,6 +157,11 @@ void pw_file_close(struct pw_file *file)
 {
 	if (!file)
 		return;
+	if (file_is_jm(file)) {
+		file_close_jm(file);
+		pw_os_free(file->os, file);
+		return;
+	}
 	/* Reverse of open: groups/heaps hold VM and BO references, VM_BIND fences live in
 	 * syncobjs, VMs hold BO references. */
 	pw_sched_file_fini(file);
@@ -233,32 +305,37 @@ static int pw_copy_field(struct pw_os *os, char *ubuf, __kernel_size_t *buf_len,
 static int pw_ioctl_version(struct pw_file *file, void *arg)
 {
 	struct drm_version *v = arg;
+	const bool jm = file_is_jm(file);
+	uint32_t major, minor, patch;
 	int ret;
 
-	v->version_major = PW_DRM_MAJOR;
-	v->version_minor = PW_DRM_MINOR;
-	v->version_patchlevel = PW_DRM_PATCH;
-	ret = pw_copy_field(file->os, v->name, &v->name_len, PW_DRM_NAME);
+	pw_device_drm_version(file->dev, &major, &minor, &patch, NULL);
+	v->version_major = (int)major;
+	v->version_minor = (int)minor;
+	v->version_patchlevel = (int)patch;
+	ret = pw_copy_field(file->os, v->name, &v->name_len, jm ? PW_JM_DRM_NAME : PW_DRM_NAME);
 	if (!ret)
 		ret = pw_copy_field(file->os, v->date, &v->date_len, PW_DRM_DATE);
 	if (!ret)
-		ret = pw_copy_field(file->os, v->desc, &v->desc_len, PW_DRM_DESC);
+		ret = pw_copy_field(file->os, v->desc, &v->desc_len, jm ? PW_JM_DRM_DESC : PW_DRM_DESC);
 	return ret;
 }
 
 /* DRM drm_getcap() for a render-only driver with DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE
- * (drv.c:1790). No PRIME on Windows: DRM_CAP_PRIME is 0. */
+ * (drv.c:1790). No PRIME on Windows: DRM_CAP_PRIME is 0.
+ * (jm-arch) panfrost has DRIVER_SYNCOBJ only (panfrost_drv.c driver_features): no timelines. */
 static int pw_ioctl_get_cap(struct pw_file *file, void *arg)
 {
 	struct drm_get_cap *c = arg;
 
-	(void)file;
 	c->value = 0;
 	switch (c->capability) {
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
 	case DRM_CAP_SYNCOBJ:
-	case DRM_CAP_SYNCOBJ_TIMELINE:
 		c->value = 1;
+		return PW_OK;
+	case DRM_CAP_SYNCOBJ_TIMELINE:
+		c->value = file_is_jm(file) ? 0 : 1;
 		return PW_OK;
 	case DRM_CAP_PRIME:
 		return PW_OK;
@@ -457,21 +534,41 @@ union pw_ioctl_arg {
 	struct drm_panthor_set_user_mmio_offset set_user_mmio_offset;
 	struct drm_panthor_bo_sync bo_sync;
 	struct drm_panthor_bo_query_info bo_query_info;
+	/* (jm-arch) panfrost */
+	struct drm_panfrost_submit pf_submit;
+	struct drm_panfrost_wait_bo pf_wait_bo;
+	struct drm_panfrost_create_bo pf_create_bo;
+	struct drm_panfrost_mmap_bo pf_mmap_bo;
+	struct drm_panfrost_get_param pf_get_param;
+	struct drm_panfrost_get_bo_offset pf_get_bo_offset;
+	struct drm_panfrost_madvise pf_madvise;
+	struct drm_panfrost_set_label_bo pf_set_label_bo;
+	struct drm_panfrost_jm_ctx_create pf_jm_ctx_create;
+	struct drm_panfrost_jm_ctx_destroy pf_jm_ctx_destroy;
+	struct drm_panfrost_sync_bo pf_sync_bo;
+	struct drm_panfrost_query_bo_info pf_query_bo_info;
 };
 
 struct pw_ioctl_desc {
 	uint8_t nr;		/* _IOC_NR */
-	uint8_t min_minor;	/* emulated minor version that introduced it */
+	uint8_t min_minor;	/* emulated minor version (of this table's driver) that added it */
 	uint16_t size;		/* sizeof the current uAPI struct */
 	pw_ioctl_fn fn;		/* NULL: fail with @err */
 	int err;
+	uint32_t flags;		/* PW_IOCTL_F_* (core table only) */
 };
 
-#define PW_NR(ioctl)		((uint8_t)((ioctl) & 0xff))
-#define PW_IOCTL(ioctl, type, f, minor)	{ PW_NR(ioctl), minor, sizeof(type), f, 0 }
-#define PW_IOCTL_UNSUPPORTED(ioctl, e)	{ PW_NR(ioctl), 0, 0, NULL, e }
+/* DRM core ioctl that needs DRIVER_SYNCOBJ_TIMELINE (drm_syncobj.c returns -EOPNOTSUPP
+ * without it): unavailable on JM, like on Linux panfrost. */
+#define PW_IOCTL_F_TIMELINE	PW_BIT(0)
 
-static const struct pw_ioctl_desc pw_ioctls[] = {
+#define PW_NR(ioctl)		((uint8_t)((ioctl) & 0xff))
+#define PW_IOCTL(ioctl, type, f, minor)	{ PW_NR(ioctl), minor, sizeof(type), f, 0, 0 }
+#define PW_IOCTL_F(ioctl, type, f, fl)	{ PW_NR(ioctl), 0, sizeof(type), f, 0, fl }
+#define PW_IOCTL_UNSUPPORTED(ioctl, e)	{ PW_NR(ioctl), 0, 0, NULL, e, 0 }
+
+/* DRM core ioctls (nr 0x00-0x3f, 0xa0-0xcf), the same for both backends. */
+static const struct pw_ioctl_desc pw_core_ioctls[] = {
 	/* DRM core (render-node subset Mesa/libdrm use) */
 	PW_IOCTL(DRM_IOCTL_VERSION, struct drm_version, pw_ioctl_version, 0),
 	PW_IOCTL(DRM_IOCTL_GET_CAP, struct drm_get_cap, pw_ioctl_get_cap, 0),
@@ -479,24 +576,26 @@ static const struct pw_ioctl_desc pw_ioctls[] = {
 	PW_IOCTL(DRM_IOCTL_SYNCOBJ_CREATE, struct drm_syncobj_create, pw_ioctl_syncobj_create, 0),
 	PW_IOCTL(DRM_IOCTL_SYNCOBJ_DESTROY, struct drm_syncobj_destroy, pw_ioctl_syncobj_destroy, 0),
 	PW_IOCTL(DRM_IOCTL_SYNCOBJ_WAIT, struct drm_syncobj_wait, pw_ioctl_syncobj_wait, 0),
-	PW_IOCTL(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, struct drm_syncobj_timeline_wait,
-		 pw_ioctl_syncobj_timeline_wait, 0),
+	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, struct drm_syncobj_timeline_wait,
+		   pw_ioctl_syncobj_timeline_wait, PW_IOCTL_F_TIMELINE),
 	PW_IOCTL(DRM_IOCTL_SYNCOBJ_RESET, struct drm_syncobj_array, pw_ioctl_syncobj_reset, 0),
 	PW_IOCTL(DRM_IOCTL_SYNCOBJ_SIGNAL, struct drm_syncobj_array, pw_ioctl_syncobj_signal, 0),
-	PW_IOCTL(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, struct drm_syncobj_timeline_array,
-		 pw_ioctl_syncobj_timeline_signal, 0),
-	PW_IOCTL(DRM_IOCTL_SYNCOBJ_QUERY, struct drm_syncobj_timeline_array,
-		 pw_ioctl_syncobj_query, 0),
-	PW_IOCTL(DRM_IOCTL_SYNCOBJ_TRANSFER, struct drm_syncobj_transfer,
-		 pw_ioctl_syncobj_transfer, 0),
+	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, struct drm_syncobj_timeline_array,
+		   pw_ioctl_syncobj_timeline_signal, PW_IOCTL_F_TIMELINE),
+	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_QUERY, struct drm_syncobj_timeline_array,
+		   pw_ioctl_syncobj_query, PW_IOCTL_F_TIMELINE),
+	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_TRANSFER, struct drm_syncobj_transfer,
+		   pw_ioctl_syncobj_transfer, PW_IOCTL_F_TIMELINE),
 	/* fd-based sharing doesn't exist on Windows (pw_sync.h) */
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, PW_EOPNOTSUPP),
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, PW_EOPNOTSUPP),
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_SYNCOBJ_EVENTFD, PW_EOPNOTSUPP),
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_PRIME_HANDLE_TO_FD, PW_EOPNOTSUPP),
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_PRIME_FD_TO_HANDLE, PW_EOPNOTSUPP),
+};
 
-	/* panthor (drv.c:1650 panthor_drm_driver_ioctls) */
+/* panthor (drv.c:1650 panthor_drm_driver_ioctls): CSF driver ioctls. */
+static const struct pw_ioctl_desc pw_panthor_ioctls[] = {
 	PW_IOCTL(DRM_IOCTL_PANTHOR_DEV_QUERY, struct drm_panthor_dev_query, pw_ioctl_dev_query, 0),
 	PW_IOCTL(DRM_IOCTL_PANTHOR_VM_CREATE, struct drm_panthor_vm_create, pw_ioctl_vm_create, 0),
 	PW_IOCTL(DRM_IOCTL_PANTHOR_VM_DESTROY, struct drm_panthor_vm_destroy, pw_ioctl_vm_destroy, 0),
@@ -528,6 +627,46 @@ static const struct pw_ioctl_desc pw_ioctls[] = {
 };
 
 /*
+ * (jm-arch) panfrost (panfrost_drv.c panfrost_drm_driver_ioctls): JM driver ioctls. The
+ * minors are the panfrost versions that added each ioctl. PERFCNT_* are "unstable" ioctls
+ * Linux only exposes with the unstable_ioctls module parameter; without it they fail with
+ * -ENOSYS (panfrost_unstable_ioctl_check), which is what we return.
+ */
+static const struct pw_ioctl_desc pw_panfrost_ioctls[] = {
+	PW_IOCTL(DRM_IOCTL_PANFROST_SUBMIT, struct drm_panfrost_submit, pw_jm_ioctl_submit, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_WAIT_BO, struct drm_panfrost_wait_bo, pw_jm_ioctl_wait_bo, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_CREATE_BO, struct drm_panfrost_create_bo,
+		 pw_jm_ioctl_create_bo, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_MMAP_BO, struct drm_panfrost_mmap_bo, pw_jm_ioctl_mmap_bo, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_GET_PARAM, struct drm_panfrost_get_param,
+		 pw_jm_ioctl_get_param, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_GET_BO_OFFSET, struct drm_panfrost_get_bo_offset,
+		 pw_jm_ioctl_get_bo_offset, 0),
+	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_PANFROST_PERFCNT_ENABLE, PW_ENOSYS),
+	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_PANFROST_PERFCNT_DUMP, PW_ENOSYS),
+	PW_IOCTL(DRM_IOCTL_PANFROST_MADVISE, struct drm_panfrost_madvise, pw_jm_ioctl_madvise, 0),
+	PW_IOCTL(DRM_IOCTL_PANFROST_SET_LABEL_BO, struct drm_panfrost_set_label_bo,
+		 pw_jm_ioctl_set_label_bo, 4),
+	PW_IOCTL(DRM_IOCTL_PANFROST_JM_CTX_CREATE, struct drm_panfrost_jm_ctx_create,
+		 pw_jm_ioctl_jm_ctx_create, 5),
+	PW_IOCTL(DRM_IOCTL_PANFROST_JM_CTX_DESTROY, struct drm_panfrost_jm_ctx_destroy,
+		 pw_jm_ioctl_jm_ctx_destroy, 5),
+	PW_IOCTL(DRM_IOCTL_PANFROST_SYNC_BO, struct drm_panfrost_sync_bo, pw_jm_ioctl_sync_bo, 6),
+	PW_IOCTL(DRM_IOCTL_PANFROST_QUERY_BO_INFO, struct drm_panfrost_query_bo_info,
+		 pw_jm_ioctl_query_bo_info, 6),
+};
+
+static const struct pw_ioctl_desc *find_ioctl(const struct pw_ioctl_desc *tbl, size_t n,
+					      uint32_t nr)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (tbl[i].nr == nr)
+			return &tbl[i];
+	}
+	return NULL;
+}
+
+/*
  * Like drm_ioctl(): the user's struct size comes from the ioctl number. A smaller (older) struct
  * is zero-extended to the current size before the handler runs and only the user's bytes are
  * copied back (truncated); a larger (newer) one is passed through, the handler only touching the
@@ -537,16 +676,28 @@ int pw_file_ioctl(struct pw_file *file, uint32_t nr, void *arg, uint32_t size)
 {
 	const struct pw_ioctl_desc *d = NULL;
 	union pw_ioctl_arg k;
+	uint32_t minor = PW_DRM_MINOR;
+	bool jm;
 	int ret;
 
-	for (size_t i = 0; i < PW_ARRAY_SIZE(pw_ioctls); i++) {
-		if (pw_ioctls[i].nr == nr) {
-			d = &pw_ioctls[i];
-			break;
-		}
-	}
-	if (!file || !d || d->min_minor > PW_DRM_MINOR)
+	if (!file)
 		return PW_ENOTTY;
+	jm = file_is_jm(file);
+	if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
+		/* Driver ioctls: the table of this device's backend, gated on its version. */
+		if (jm) {
+			d = find_ioctl(pw_panfrost_ioctls, PW_ARRAY_SIZE(pw_panfrost_ioctls), nr);
+			minor = PW_JM_DRM_MINOR;
+		} else {
+			d = find_ioctl(pw_panthor_ioctls, PW_ARRAY_SIZE(pw_panthor_ioctls), nr);
+		}
+	} else {
+		d = find_ioctl(pw_core_ioctls, PW_ARRAY_SIZE(pw_core_ioctls), nr);
+	}
+	if (!d || d->min_minor > minor)
+		return PW_ENOTTY;
+	if (jm && (d->flags & PW_IOCTL_F_TIMELINE))
+		return PW_EOPNOTSUPP;
 	if (!d->fn)
 		return d->err;
 	if (size && !arg)
@@ -583,6 +734,9 @@ int pw_file_mmap_lookup(struct pw_file *file, uint64_t offset, uint64_t size,
 	if (!size || (offset & (PW_SZ_4K - 1)) || (size & (PW_SZ_4K - 1)))
 		return PW_EINVAL;
 
+	/* (jm-arch) panfrost maps no register page to userspace: BO offsets only. */
+	if (offset >= DRM_PANTHOR_USER_MMIO_OFFSET_32BIT && file_is_jm(file))
+		return PW_EINVAL;
 	if (offset >= DRM_PANTHOR_USER_MMIO_OFFSET_32BIT) {
 		if (offset != DRM_PANTHOR_USER_MMIO_OFFSET_32BIT &&
 		    offset != DRM_PANTHOR_USER_MMIO_OFFSET_64BIT)

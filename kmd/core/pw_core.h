@@ -23,7 +23,8 @@ struct pw_device_params {
 	/* Firmware path relative to the firmware root; NULL = derive from GPU_ID
 	 * ("arm/mali/arch%u.%u/mali_csffw.bin"). */
 	const char *fw_name;
-	/* If false, stop after GPU init (GPU_ID, reset, L2) and skip MMU/FW: M1 bring-up mode. */
+	/* If false, stop after GPU init (GPU_ID, reset, L2) and skip MMU/FW: M1 bring-up mode.
+	 * CSF only: ignored on a job-manager GPU (see enum pw_backend). */
 	bool boot_firmware;
 	/* Arch timer frequency (CNTFRQ_EL0) for FW timeouts; 0 = 24 MHz (RK3588). */
 	uint32_t timer_hz;
@@ -135,5 +136,43 @@ typedef void (*pw_notify_fn)(void *ctx);
 int  pw_file_syncobj_notify(struct pw_file *file, uint32_t handle, uint64_t point, uint32_t flags,
 			    pw_notify_fn fn, void *ctx, void **cookie);
 bool pw_file_syncobj_notify_cancel(struct pw_file *file, void *cookie);
+
+/* ---- additions (jm-arch): two backends, chosen from GPU_ID at probe ---- */
+
+/*
+ * Which programming model the probed GPU uses. pw_gpu_init() picks it from GPU_ID before any
+ * backend-specific register is touched, and it never changes afterwards:
+ *   arch major 6, 7 (Bifrost)      -> PW_BACKEND_JM: job manager, no firmware, Linux panfrost
+ *                                     uAPI (DRM driver name "panfrost")
+ *   arch major 10..13 (Valhall CSF) -> PW_BACKEND_CSF: MCU firmware, Linux panthor uAPI
+ *                                     ("panthor"), everything that existed before JM
+ *   anything else (Midgard 4/5, Valhall JM 9, arch 14+) -> probe fails with PW_EOPNOTSUPP.
+ * PW_BACKEND_NONE until GPU_ID was read (or when it could not be).
+ *
+ * Effect on the contracts above:
+ *  - pw_device_params.boot_firmware: CSF only. A JM device has no firmware and always does its
+ *    full init (GPU, MMU, job slots); the flag is ignored there.
+ *  - pw_device_get_gpu_info(): filled on both backends from the shared GPU_CONTROL registers;
+ *    on JM the CSF-only fields (csf_id, gpu_features) are 0. CSIF_INFO fails with PW_ENOENT.
+ *  - pw_file_ioctl(): driver ioctls (nr 0x40-0x9f) are the panthor ones on CSF and the panfrost
+ *    ones (0x40 + DRM_PANFROST_*) on JM; DRM core ioctls are the same on both.
+ *  - pw_file_mmap_lookup(): on JM there is no user-MMIO window (offsets >= 1 << 43 are EINVAL).
+ *  - pw_core_drm_version() keeps reporting the panthor version (CSF); use
+ *    pw_device_drm_version() for the version of a given device.
+ */
+enum pw_backend {
+	PW_BACKEND_NONE = 0,
+	PW_BACKEND_CSF = 1,
+	PW_BACKEND_JM = 2,
+};
+
+/* Backend for a raw GPU_ID value (pure function, used by probe and by tests). */
+enum pw_backend pw_backend_for_gpu_id(uint32_t gpu_id);
+/* Backend of a probed device; PW_BACKEND_NONE for NULL or before GPU_ID was read. */
+enum pw_backend pw_device_backend(const struct pw_device *dev);
+/* DRM_IOCTL_VERSION of this device: "panthor" + pw_core_drm_version() on CSF, "panfrost" +
+ * the emulated panfrost version on JM. @name may be NULL; the string is static. */
+void pw_device_drm_version(const struct pw_device *dev, uint32_t *major, uint32_t *minor,
+			   uint32_t *patch, const char **name);
 
 #endif /* PW_CORE_H */

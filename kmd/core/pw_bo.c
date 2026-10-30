@@ -112,8 +112,8 @@ static inline bool range_overflows(uint64_t start, uint64_t size, uint64_t max)
 /* BO lifetime                                                                                */
 /* ------------------------------------------------------------------------------------------ */
 
-static int bo_alloc(struct pw_device *dev, uint64_t size, uint32_t mem_flags, bool cpu_cached,
-		    struct pw_bo **out)
+static int bo_alloc_common(struct pw_device *dev, uint64_t size, uint32_t mem_flags,
+			   bool cpu_cached, bool backed, struct pw_bo **out)
 {
 	struct pw_bo_priv *p;
 	int ret;
@@ -124,10 +124,12 @@ static int bo_alloc(struct pw_device *dev, uint64_t size, uint32_t mem_flags, bo
 	p = pw_os_zalloc(dev->os, sizeof(*p));
 	if (!p)
 		return PW_ENOMEM;
-	ret = pw_os_mem_alloc(dev->os, (size_t)size, mem_flags, &p->base.mem);
-	if (ret) {
-		pw_os_free(dev->os, p);
-		return ret == PW_EINVAL ? PW_ENOMEM : ret;
+	if (backed) {
+		ret = pw_os_mem_alloc(dev->os, (size_t)size, mem_flags, &p->base.mem);
+		if (ret) {
+			pw_os_free(dev->os, p);
+			return ret == PW_EINVAL ? PW_ENOMEM : ret;
+		}
 	}
 	p->base.refcount = 1;
 	p->base.dev = dev;
@@ -135,6 +137,20 @@ static int bo_alloc(struct pw_device *dev, uint64_t size, uint32_t mem_flags, bo
 	p->cpu_cached = cpu_cached;
 	*out = &p->base;
 	return PW_OK;
+}
+
+static int bo_alloc(struct pw_device *dev, uint64_t size, uint32_t mem_flags, bool cpu_cached,
+		    struct pw_bo **out)
+{
+	return bo_alloc_common(dev, size, mem_flags, cpu_cached, true, out);
+}
+
+/* (jm-arch) pw_bo.h */
+int pw_bo_alloc(struct pw_device *dev, uint64_t size, uint32_t mem_flags, bool cpu_cached,
+		bool backed, struct pw_bo **out)
+{
+	*out = NULL;
+	return bo_alloc_common(dev, size, mem_flags, cpu_cached, backed, out);
 }
 
 void pw_bo_get(struct pw_bo *bo)
@@ -149,7 +165,11 @@ void pw_bo_put(struct pw_bo *bo)
 	if (!bo || __atomic_sub_fetch(&bo->refcount, 1, __ATOMIC_ACQ_REL))
 		return;
 	os = bo->dev->os;
-	pw_os_mem_free(os, bo->mem);
+	/* (jm-arch) backend state first: it may still reference the pages (GPU mappings). */
+	if (bo->release_ext)
+		bo->release_ext(bo);
+	if (bo->mem)
+		pw_os_mem_free(os, bo->mem);
 	pw_os_free(os, to_priv(bo));
 }
 
@@ -337,17 +357,14 @@ int pw_ioctl_gem_close(struct pw_file *file, void *arg)
 	return PW_OK;
 }
 
-/* drv.c:1077 */
-int pw_ioctl_bo_mmap_offset(struct pw_file *file, void *arg)
+/* (jm-arch) pw_bo.h; the body of drv.c:1077 panthor_ioctl_bo_mmap_offset after its pad check. */
+int pw_bo_get_mmap_offset(struct pw_file *file, uint32_t handle, uint64_t *offset)
 {
-	struct drm_panthor_bo_mmap_offset *args = arg;
 	struct pw_bo_file *bf = file->bo_file;
 	struct pw_bo *bo;
 	int ret = PW_OK;
 
-	if (args->pad)
-		return PW_EINVAL;
-	bo = pw_file_bo_get(file, args->handle);
+	bo = pw_file_bo_get(file, handle);
 	if (!bo)
 		return PW_ENOENT;
 	if (bo->flags & DRM_PANTHOR_BO_NO_MMAP) {
@@ -357,15 +374,30 @@ int pw_ioctl_bo_mmap_offset(struct pw_file *file, void *arg)
 	pw_os_mutex_lock(bf->lock);
 	/* A racing GEM_CLOSE removes the handle before unlinking under bf->lock: re-check under
 	 * the lock so a closed BO never (re)enters the list. */
-	if (pw_handle_get(&file->bos, args->handle, NULL) != bo)
+	if (pw_handle_get(&file->bos, handle, NULL) != bo)
 		ret = PW_ENOENT;
 	else if (!to_priv(bo)->mm_linked)
 		ret = mm_assign_locked(bf, to_priv(bo));
 	if (!ret)
-		args->offset = bo->mmap_offset;
+		*offset = bo->mmap_offset;
 	pw_os_mutex_unlock(bf->lock);
 out:
 	pw_bo_put(bo);
+	return ret;
+}
+
+/* drv.c:1077 */
+int pw_ioctl_bo_mmap_offset(struct pw_file *file, void *arg)
+{
+	struct drm_panthor_bo_mmap_offset *args = arg;
+	uint64_t offset;
+	int ret;
+
+	if (args->pad)
+		return PW_EINVAL;
+	ret = pw_bo_get_mmap_offset(file, args->handle, &offset);
+	if (!ret)
+		args->offset = offset;
 	return ret;
 }
 
@@ -374,28 +406,37 @@ out:
 int pw_ioctl_bo_set_label(struct pw_file *file, void *arg)
 {
 	struct drm_panthor_bo_set_label *args = arg;
-	char label[sizeof(((struct pw_bo *)0)->label)];
 	struct pw_bo *bo;
-	size_t len = 0;
-	bool found_nul = false;
-	int ret = PW_OK;
+	int ret;
 
 	if (args->pad)
 		return PW_EINVAL;
 	bo = pw_file_bo_get(file, args->handle);
 	if (!bo)
 		return PW_ENOENT;
+	ret = pw_bo_set_label_from_user(file, bo, args->label);
+	pw_bo_put(bo);
+	return ret;
+}
+
+/* (jm-arch) pw_bo.h; the label part of pw_ioctl_bo_set_label() above. */
+int pw_bo_set_label_from_user(struct pw_file *file, struct pw_bo *bo, uint64_t user_label)
+{
+	char label[sizeof(((struct pw_bo *)0)->label)];
+	size_t len = 0;
+	bool found_nul = false;
+	int ret = PW_OK;
 
 	label[0] = '\0';
-	if (args->label) {
+	if (user_label) {
 		/* Byte by byte, like strnlen_user(): never read past the terminator (the next byte
 		 * may be on an unmapped page). Labels are short and this ioctl is rare. */
 		for (len = 0; len < PW_BO_LABEL_MAXLEN; len++) {
 			char c;
 
-			ret = pw_os_copy_from_user(file->os, &c, args->label + len, 1);
+			ret = pw_os_copy_from_user(file->os, &c, user_label + len, 1);
 			if (ret)
-				goto out;
+				return ret;
 			if (len < sizeof(label))
 				label[len] = c;
 			if (!c) {
@@ -403,18 +444,14 @@ int pw_ioctl_bo_set_label(struct pw_file *file, void *arg)
 				break;
 			}
 		}
-		if (!found_nul) {
-			ret = PW_E2BIG;
-			goto out;
-		}
+		if (!found_nul)
+			return PW_E2BIG;
 		label[PW_MIN(len, sizeof(label) - 1)] = '\0';
 	}
 
 	pw_os_mutex_lock(file->bo_file->lock);
 	pw_memcpy(bo->label, label, sizeof(label));
 	pw_os_mutex_unlock(file->bo_file->lock);
-out:
-	pw_bo_put(bo);
 	return ret;
 }
 

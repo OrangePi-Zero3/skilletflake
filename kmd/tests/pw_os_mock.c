@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 /*
  * pw_os_mock.c - pw_os.h for Linux host tests: mock register file + behavioural G610 model.
+ * (jm-arch) mock_config.model selects a G31 (job manager) instead: GPU_ID/features of a G31 MP2
+ * (mock_gpu.h, partly guessed), JM GPU_CMD encodings (SOFT_RESET 0x01, CLEAN(_INV)_CACHES
+ * 0x07/0x08), shader/tiler/stack PWRON -> READY, a 256 KiB register window, no MCU, and the
+ * JOB_CONTROL slot registers routed to mock_jm.c.
  *
  * Model summary (see mock_gpu.h):
  *  - GPU: GPU_ID/features from a real G610 dump, soft reset -> RESET_COMPLETED, L2_PWRON ->
@@ -163,6 +167,25 @@ static void *mock_memmem(const void *h, size_t hl, const void *n, size_t nl)
 #define R_AS_STATUS		0x28
 #define R_AS_TRANSCFG		0x30
 #define R_DOORBELL0		0x80000u
+/* (jm-arch) JM-only registers used by the G31 model. */
+#define R_SHADER_READY		0x140
+#define R_TILER_READY		0x150
+#define R_SHADER_PWRON		0x180
+#define R_TILER_PWRON		0x190
+#define R_SHADER_PWROFF		0x1c0
+#define R_TILER_PWROFF		0x1d0
+#define R_GPU_STATUS		0x34
+#define R_JS_PRESENT		0x1c
+#define R_JS_FEATURES(n)	(0xc0 + (n) * 4)
+#define R_AFBC_FEATURES		0x4c
+#define R_THREAD_TLS_ALLOC	0x310
+#define R_STACK_PRESENT		0xe00
+#define R_STACK_READY		0xe10
+#define R_STACK_PWRON		0xe20
+#define R_STACK_PWROFF		0xe30
+#define R_JOB_CONTROL_EXTRA	0x1010u		/* JS_STATE..: after the JOB_INT block */
+#define R_JOB_CONTROL_END	0x2000u
+#define G31_REG_WINDOW		0x40000u	/* gpu@1800000 is 0x40000 bytes */
 
 #define GPU_IRQ_RESET_COMPLETED		(1u << 8)
 #define GPU_IRQ_POWER_CHANGED_BOTH	(3u << 9)
@@ -286,6 +309,7 @@ struct pw_os {
 
 	long allocs, mems, syncs;
 	struct mock_csf *csf;
+	struct mock_jm *jm;		/* (jm-arch) G31 model */
 };
 
 static const uint32_t int_base[3] = { 0x1000, 0x2000, 0x20 };
@@ -929,6 +953,34 @@ struct mock_csf *mock_csf_of(struct pw_os *os)
 	return os->csf;
 }
 
+/* ---- (jm-arch) mock_internal.h accessors for mock_jm.c ---- */
+
+struct mock_jm *mock_jm_of(struct pw_os *os)
+{
+	return os->jm;
+}
+
+enum mock_model mock_model_of(struct pw_os *os)
+{
+	return os->cfg.model;
+}
+
+uint32_t mock_reg_get_locked(struct pw_os *os, uint32_t off)
+{
+	return off < REG_SPACE ? os->regs[off / 4] : 0;
+}
+
+void mock_reg_set_locked(struct pw_os *os, uint32_t off, uint32_t v)
+{
+	if (off < REG_SPACE)
+		os->regs[off / 4] = v;
+}
+
+static bool is_jm(const struct pw_os *os)
+{
+	return os->cfg.model == MOCK_MODEL_G31;
+}
+
 /* ------------------------------------------------------------------------------------------ */
 /* emulated MCU                                                                               */
 /* ------------------------------------------------------------------------------------------ */
@@ -1164,7 +1216,14 @@ static void soft_reset_locked(struct pw_os *os)
 	memset(os->as_busy, 0, sizeof(os->as_busy));
 	os->mcu_running = false;
 	os->mcu_status = 0;
-	mock_csf_reset_locked(os);
+	if (is_jm(os)) {
+		os->regs[R_SHADER_READY / 4] = os->regs[R_SHADER_READY / 4 + 1] = 0;
+		os->regs[R_TILER_READY / 4] = os->regs[R_TILER_READY / 4 + 1] = 0;
+		os->regs[R_STACK_READY / 4] = os->regs[R_STACK_READY / 4 + 1] = 0;
+		mock_jm_reset_locked(os);
+	} else {
+		mock_csf_reset_locked(os);
+	}
 	memset(os->delayed_bits, 0, sizeof(os->delayed_bits));
 	raise_later_locked(os, 2, GPU_IRQ_RESET_COMPLETED);
 }
@@ -1213,6 +1272,69 @@ static void as_command_locked(struct pw_os *os, unsigned int as, uint32_t cmd)
 	raise_locked(os, 1, 1u << (16 + as));	/* REQ_COMPLETE, must stay masked */
 }
 
+/*
+ * (jm-arch) GPU_CONTROL writes that mean something else on the G31: GPU_CMD encodings, shader /
+ * tiler / stack power (READY follows PWRON at once: the core polls READY), no MCU. Returns true
+ * if handled. L2 power, AS and interrupt registers use the shared model.
+ */
+static bool jm_gpu_reg_write_locked(struct pw_os *os, uint32_t off, uint32_t v)
+{
+	switch (off) {
+	case R_GPU_CMD:
+		switch (v) {
+		case 0x00:		/* NOP */
+			break;
+		case 0x01:		/* SOFT_RESET */
+		case 0x02:		/* HARD_RESET */
+			soft_reset_locked(os);
+			break;
+		case 0x05:		/* CYCLE_COUNT_START */
+			os->regs[R_GPU_STATUS / 4] |= 1u << 6;
+			break;
+		case 0x06:		/* CYCLE_COUNT_STOP */
+			os->regs[R_GPU_STATUS / 4] &= ~(1u << 6);
+			break;
+		case 0x07:		/* CLEAN_CACHES */
+		case 0x08:		/* CLEAN_INV_CACHES */
+			os->flushes++;
+			os->last_flush = v;
+			raise_later_locked(os, 2, GPU_IRQ_CLEAN_CACHES);
+			break;
+		default:
+			model_error(os, "G31: unexpected GPU_CMD 0x%x", v);
+		}
+		return true;
+	case R_SHADER_PWRON:
+	case R_TILER_PWRON:
+		os->regs[(off - 0x40) / 4] |= v;	/* *_READY is PWRON - 0x40 */
+		raise_locked(os, 2, GPU_IRQ_POWER_CHANGED_BOTH);
+		return true;
+	case R_STACK_PWRON:
+		os->regs[R_STACK_READY / 4] |= v;
+		raise_locked(os, 2, GPU_IRQ_POWER_CHANGED_BOTH);
+		return true;
+	case R_SHADER_PWROFF:
+	case R_TILER_PWROFF:
+		os->regs[(off - 0x80) / 4] &= ~v;	/* *_READY is PWROFF - 0x80 */
+		raise_locked(os, 2, GPU_IRQ_POWER_CHANGED_BOTH);
+		return true;
+	case R_STACK_PWROFF:
+		os->regs[R_STACK_READY / 4] &= ~v;
+		raise_locked(os, 2, GPU_IRQ_POWER_CHANGED_BOTH);
+		return true;
+	case R_SHADER_PWRON + 4:
+	case R_TILER_PWRON + 4:
+	case R_SHADER_PWROFF + 4:
+	case R_TILER_PWROFF + 4:
+		return true;
+	case R_MCU_CONTROL:
+		model_error(os, "G31: MCU_CONTROL write (no MCU on a job-manager GPU)");
+		return true;
+	default:
+		return false;
+	}
+}
+
 uint32_t pw_os_reg_read32(struct pw_os *os, uint32_t off)
 {
 	uint32_t v, sub;
@@ -1225,7 +1347,17 @@ uint32_t pw_os_reg_read32(struct pw_os *os, uint32_t off)
 		pthread_mutex_unlock(&os->lock);
 		return 0;
 	}
+	if (is_jm(os) && off >= G31_REG_WINDOW) {
+		model_error(os, "G31: register read at 0x%x, outside the 256 KiB window", off);
+		pthread_mutex_unlock(&os->lock);
+		return 0;
+	}
 	line = int_line(off, &sub);
+	if (is_jm(os) && line < 0 && off >= R_JOB_CONTROL_EXTRA && off < R_JOB_CONTROL_END &&
+	    mock_jm_reg_read_locked(os, off, &v)) {
+		pthread_mutex_unlock(&os->lock);
+		return v;
+	}
 	if (line >= 0) {
 		switch (sub) {
 		case 0x0:
@@ -1294,7 +1426,18 @@ void pw_os_reg_write32(struct pw_os *os, uint32_t off, uint32_t v)
 		model_error(os, "bad register write at 0x%x", off);
 		goto out;
 	}
+	if (is_jm(os) && off >= G31_REG_WINDOW) {
+		model_error(os, "G31: register write at 0x%x, outside the 256 KiB window", off);
+		goto out;
+	}
 	line = int_line(off, &sub);
+	if (is_jm(os) && line < 0 && off >= R_JOB_CONTROL_EXTRA && off < R_JOB_CONTROL_END) {
+		if (!mock_jm_reg_write_locked(os, off, v))
+			os->regs[off / 4] = v;
+		goto out;
+	}
+	if (is_jm(os) && jm_gpu_reg_write_locked(os, off, v))
+		goto out;
 	if (line >= 0) {
 		if (sub == 0x4)
 			os->rawstat[line] &= ~v;
@@ -1549,13 +1692,19 @@ void mock_glb_snapshot(struct pw_os *os, struct mock_glb_snapshot *s)
 	pthread_mutex_unlock(&os->lock);
 }
 
-void mock_inject_mmu_fault(struct pw_os *os, unsigned int as, uint32_t fault_status, uint64_t va)
+void mock_raise_mmu_fault_locked(struct pw_os *os, unsigned int as, uint32_t fault_status,
+				 uint64_t va)
 {
-	pthread_mutex_lock(&os->lock);
 	os->regs[(R_AS(as) + R_AS_FAULTSTATUS) / 4] = fault_status;
 	os->regs[(R_AS(as) + R_AS_FAULTADDRESS) / 4] = (uint32_t)va;
 	os->regs[(R_AS(as) + R_AS_FAULTADDRESS + 4) / 4] = (uint32_t)(va >> 32);
 	raise_locked(os, 1, 1u << as);
+}
+
+void mock_inject_mmu_fault(struct pw_os *os, unsigned int as, uint32_t fault_status, uint64_t va)
+{
+	pthread_mutex_lock(&os->lock);
+	mock_raise_mmu_fault_locked(os, as, fault_status, va);
 	pthread_mutex_unlock(&os->lock);
 }
 
@@ -1586,6 +1735,33 @@ static void set64(struct pw_os *os, uint32_t off, uint64_t v)
 	os->regs[off / 4 + 1] = (uint32_t)(v >> 32);
 }
 
+/* (jm-arch) G31 MP2 register values (mock_gpu.h says which are guesses). */
+static void init_g31_regs(struct pw_os *os)
+{
+	os->regs[0x4 / 4] = MOCK_G31_L2_FEATURES;
+	os->regs[0x8 / 4] = MOCK_G31_CORE_FEATURES;
+	os->regs[0xc / 4] = MOCK_G31_TILER_FEATURES;
+	os->regs[0x10 / 4] = MOCK_G31_MEM_FEATURES;
+	os->regs[0x14 / 4] = MOCK_G31_MMU_FEATURES;
+	os->regs[0x18 / 4] = MOCK_G31_AS_PRESENT;
+	os->regs[R_JS_PRESENT / 4] = MOCK_G31_JS_PRESENT;
+	os->regs[R_AFBC_FEATURES / 4] = MOCK_G31_AFBC_FEATURES;
+	os->regs[0xa0 / 4] = MOCK_G31_MAX_THREADS;
+	os->regs[0xa4 / 4] = MOCK_G31_MAX_WG_SIZE;
+	os->regs[0xa8 / 4] = MOCK_G31_MAX_BARRIER;
+	os->regs[0xac / 4] = MOCK_G31_THREAD_FEATURES;
+	os->regs[0xb0 / 4] = MOCK_G31_TEXTURE_FEATURES0;
+	os->regs[R_JS_FEATURES(0) / 4] = MOCK_G31_JS0_FEATURES;
+	os->regs[R_JS_FEATURES(1) / 4] = MOCK_G31_JS1_FEATURES;
+	os->regs[R_JS_FEATURES(2) / 4] = MOCK_G31_JS2_FEATURES;
+	set64(os, 0x100, MOCK_G31_SHADER_PRESENT);
+	set64(os, 0x110, MOCK_G31_TILER_PRESENT);
+	set64(os, 0x120, MOCK_G31_L2_PRESENT);
+	os->regs[0x300 / 4] = MOCK_G31_COHERENCY_FEATURES;
+	os->regs[R_THREAD_TLS_ALLOC / 4] = MOCK_G31_THREAD_TLS_ALLOC;
+	set64(os, R_STACK_PRESENT, MOCK_G31_STACK_PRESENT);
+}
+
 struct pw_os *mock_create(const struct mock_config *cfg)
 {
 	struct pw_os *os = calloc(1, sizeof(*os));
@@ -1595,7 +1771,7 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 	if (cfg)
 		os->cfg = *cfg;
 	if (!os->cfg.gpu_id)
-		os->cfg.gpu_id = MOCK_G610_GPU_ID;
+		os->cfg.gpu_id = is_jm(os) ? MOCK_G31_GPU_ID : MOCK_G610_GPU_ID;
 	if (!os->cfg.as_busy_reads)
 		os->cfg.as_busy_reads = 2;
 	if (!os->cfg.completion_delay_us)
@@ -1605,7 +1781,8 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 	os->regs = calloc(REG_SPACE / 4, sizeof(uint32_t));
 	os->pa_pages = calloc(PA_NPAGES, sizeof(*os->pa_pages));
 	os->csf = mock_csf_create();
-	if (!os->regs || !os->pa_pages || !os->csf)
+	os->jm = mock_jm_create();
+	if (!os->regs || !os->pa_pages || !os->csf || !os->jm)
 		abort();
 
 	pthread_mutex_init(&os->lock, NULL);
@@ -1628,6 +1805,10 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 	set64(os, 0x110, MOCK_G610_TILER_PRESENT);
 	set64(os, 0x120, MOCK_G610_L2_PRESENT);
 	os->regs[0x300 / 4] = 0;			/* coherency features (G610 dump) */
+	if (is_jm(os))
+		init_g31_regs(os);
+	if (os->cfg.as_present)
+		os->regs[0x18 / 4] = os->cfg.as_present;
 
 	os->running = true;
 	for (unsigned int i = 0; i < 3; i++) {
@@ -1655,6 +1836,7 @@ void mock_destroy(struct pw_os *os)
 	free(os->regs);
 	free(os->pa_pages);
 	mock_csf_destroy(os->csf);
+	mock_jm_destroy(os->jm);
 	free(os);
 }
 

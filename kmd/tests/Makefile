@@ -18,7 +18,8 @@ CFLAGS  += -std=c11 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 LDFLAGS += -fsanitize=address,undefined -pthread
 
 CORE_SRCS := $(addprefix $(CORE)/,$(shell sed -n "s/^  '\(pw_[a-z_]*\.c\)',/\1/p" $(CORE)/meson.build))
-TEST_SRCS := test_main.c test_util.c test_fw_parse.c test_mmu.c test_device.c test_mem.c test_sync.c test_sched.c pw_os_mock.c mock_csf.c
+TEST_SRCS := test_main.c test_util.c test_fw_parse.c test_mmu.c test_device.c test_mem.c test_sync.c test_sched.c \
+             test_jm_hw.c test_jm_mem.c test_jm_sched.c pw_os_mock.c mock_csf.c mock_jm.c
 OBJDIR    := obj
 OBJS      := $(addprefix $(OBJDIR)/core_,$(notdir $(CORE_SRCS:.c=.o))) \
              $(addprefix $(OBJDIR)/,$(TEST_SRCS:.c=.o))
@@ -56,7 +57,7 @@ freestanding: | $(OBJDIR)
 	done
 	@echo "undefined symbols (must be pw_os_* only, plus possibly memcpy/memset):"
 	@$(LLVM_MINGW)/bin/llvm-nm -u $(OBJDIR)/arm64_*.o | awk 'NF==2 {print $$2}' | sort -u | \
-		grep -v '^pw_\(gpu\|mmu\|fw\|irq\|vm\|poll\|mem\|str\|snprintf\|vsnprintf\|exception\|device\)' | tr '\n' ' '; echo
+		grep -v '^pw_\(gpu\|mmu\|fw\|irq\|vm\|poll\|mem\|str\|snprintf\|vsnprintf\|exception\|device\|jm\)' | tr '\n' ' '; echo
 
 clean:
 	rm -rf $(OBJDIR) pw_tests

@@ -7,8 +7,17 @@
  *   -> MMU (IRQ) -> FW (job IRQ, MCU VM, sections, AS0, MCU boot, ifaces, global init, ping).
  * Deviation: panthor doesn't soft-reset at probe (only in its reset work, device.c:142); we do,
  * because the state left by UEFI on Windows is unknown.
+ *
+ * (jm-arch) A job-manager GPU (enum pw_backend) shares GPU_ID -> reset -> L2 -> MMU, then runs
+ * the JM modules instead of the firmware (panfrost_device_init order: gpu, mmu, job):
+ *   pw_jm_hw_init (features, quirks, shader/tiler power, job IRQ, AS slots)
+ *   -> pw_jm_mem_init -> pw_jm_sched_init.
  */
 
+#include "pw_file.h"
+#include "pw_jm_hw.h"
+#include "pw_jm_mem.h"
+#include "pw_jm_sched.h"
 #include "pw_mmu.h"
 #include "pw_priv.h"
 #include "pw_sched.h"
@@ -34,6 +43,13 @@ int pw_device_alloc(const struct pw_device_params *params, struct pw_device **ou
  * every line. Sync objects stay alive, since bottom halves may still be running. */
 static void device_quiesce(struct pw_device *dev)
 {
+	/* (jm-arch) JM: reverse of device_probe_jm(); every fini is a no-op if its init never ran,
+	 * and the CSF finis below are no-ops on JM (nothing was started). */
+	if (dev->backend == PW_BACKEND_JM) {
+		pw_jm_sched_fini(dev);
+		pw_jm_mem_fini(dev);
+		pw_jm_hw_fini(dev);
+	}
 	/* The OS layer closed every file first, so no group is left; the scheduler's work item
 	 * goes before the MCU (sched.c:4050 panthor_sched_unplug runs before panthor_fw_unplug). */
 	pw_sched_fini(dev);
@@ -44,6 +60,27 @@ static void device_quiesce(struct pw_device *dev)
 	pw_gpu_fini(dev);
 	for (unsigned int i = 0; i < PW_IRQ_COUNT; i++)
 		pw_irq_suspend(dev, (enum pw_irq_line)i);
+}
+
+/* (jm-arch) JM: no firmware; boot_firmware is ignored (pw_core.h, enum pw_backend). */
+static int device_probe_jm(struct pw_device *dev)
+{
+	int ret;
+
+	ret = pw_mmu_init(dev);
+	if (ret)
+		return ret;
+	ret = pw_jm_hw_init(dev);
+	if (ret)
+		return ret;
+	ret = pw_jm_mem_init(dev);
+	if (ret)
+		return ret;
+	ret = pw_jm_sched_init(dev);
+	if (ret)
+		return ret;
+	pw_info(dev, "job manager initialised");
+	return PW_OK;
 }
 
 static int device_probe(struct pw_device *dev)
@@ -61,6 +98,9 @@ static int device_probe(struct pw_device *dev)
 	ret = pw_gpu_l2_power_on(dev);
 	if (ret)
 		return ret;
+
+	if (dev->backend == PW_BACKEND_JM)
+		return device_probe_jm(dev);
 
 	if (!dev->fw_name[0]) {
 		/* fw.c:811 */
@@ -129,6 +169,11 @@ void pw_device_destroy(struct pw_device *dev)
 	if (!dev)
 		return;
 	device_quiesce(dev);
+	if (dev->backend == PW_BACKEND_JM) {
+		pw_jm_sched_release(dev);
+		pw_jm_mem_release(dev);
+		pw_jm_hw_release(dev);
+	}
 	pw_fw_release(dev);
 	pw_mmu_release(dev);
 	pw_gpu_release(dev);
@@ -191,7 +236,9 @@ void pw_device_describe(struct pw_device *dev, char *buf, size_t len)
 	if (n < 0 || (size_t)n >= len)
 		return;
 
-	if (pw_device_fw_booted(dev)) {
+	if (dev->backend == PW_BACKEND_JM) {
+		pw_snprintf(buf + n, len - (size_t)n, ", job manager (no firmware)");
+	} else if (pw_device_fw_booted(dev)) {
 		uint32_t v = PW_READ_ONCE(dev->fw.glb.control->version);
 
 		pw_snprintf(buf + n, len - (size_t)n, ", fw booted (iface v%u.%u.%u), %u CSGs",
@@ -202,4 +249,25 @@ void pw_device_describe(struct pw_device *dev, char *buf, size_t len)
 	} else {
 		pw_snprintf(buf + n, len - (size_t)n, ", fw not booted");
 	}
+}
+
+/* ---- (jm-arch) backend queries ---- */
+
+enum pw_backend pw_device_backend(const struct pw_device *dev)
+{
+	return dev ? dev->backend : PW_BACKEND_NONE;
+}
+
+void pw_device_drm_version(const struct pw_device *dev, uint32_t *major, uint32_t *minor,
+			   uint32_t *patch, const char **name)
+{
+	if (dev && dev->backend == PW_BACKEND_JM) {
+		pw_jm_drm_version(major, minor, patch);
+		if (name)
+			*name = PW_JM_DRM_NAME;
+		return;
+	}
+	pw_core_drm_version(major, minor, patch);
+	if (name)
+		*name = "panthor";
 }

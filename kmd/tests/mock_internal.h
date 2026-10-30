@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * mock_internal.h - interface between the mock's register/memory model (pw_os_mock.c) and its
- * CSF command-stream executor (mock_csf.c). Not for tests: they use mock_gpu.h.
+ * CSF command-stream executor (mock_csf.c) / job-chain executor (mock_jm.c). Not for tests:
+ * they use mock_gpu.h.
  */
 #ifndef MOCK_INTERNAL_H
 #define MOCK_INTERNAL_H
@@ -52,5 +53,28 @@ void mock_csf_reset_locked(struct pw_os *os);
 void mock_csf_glb_doorbell_locked(struct pw_os *os, uint32_t csg_mask);
 /* CS doorbell @id (>= 1). */
 void mock_csf_doorbell_locked(struct pw_os *os, uint32_t id);
+
+/* ---- (jm-arch) pw_os_mock.c, for mock_jm.c ---- */
+struct mock_jm;
+struct mock_jm *mock_jm_of(struct pw_os *os);
+enum mock_model mock_model_of(struct pw_os *os);
+/* Raw register file (no side effects), for the executor's JS_* registers. */
+uint32_t mock_reg_get_locked(struct pw_os *os, uint32_t off);
+void mock_reg_set_locked(struct pw_os *os, uint32_t off, uint32_t v);
+/* MMU fault on @as (like mock_inject_mmu_fault), for GPU accesses that fault. */
+void mock_raise_mmu_fault_locked(struct pw_os *os, unsigned int as, uint32_t fault_status,
+				 uint64_t va);
+
+/* ---- (jm-arch) mock_jm.c, for pw_os_mock.c (G31 model only) ---- */
+struct mock_jm *mock_jm_create(void);
+void mock_jm_destroy(struct mock_jm *jm);
+/* GPU soft/hard reset: every slot idle, NEXT registers cleared. */
+void mock_jm_reset_locked(struct pw_os *os);
+/* A write to JOB_CONTROL (0x1010-0x1fff: JS_STATE, THROTTLE, JS_* slot registers; the
+ * JOB_INT block itself is modelled by pw_os_mock.c). Return true if the executor handled it
+ * (including storing it), false to let pw_os_mock.c store it as a plain register. */
+bool mock_jm_reg_write_locked(struct pw_os *os, uint32_t off, uint32_t v);
+/* A read from the same range: return true and *v if the executor supplies the value. */
+bool mock_jm_reg_read_locked(struct pw_os *os, uint32_t off, uint32_t *v);
 
 #endif /* MOCK_INTERNAL_H */
