@@ -130,13 +130,11 @@ engineer must keep their tests independent of the guessed values (read them from
 
 ## Open questions (for a human / the lead)
 
-1. **Mesa on Windows has no JM kmod.** Our patch `0010-pan-kmod-support-Windows-through-libdrm-win`
-   compiles `panfrost_kmod.c` only on non-Windows ("needs eventfd/timerfd/poll for perf counters").
-   Using the G31 from panvk/Gallium on Windows needs that file built on Windows, with the
-   perf-counter paths stubbed and mmap routed through libdrm-win like `panthor_kmod.c`. That work is
-   under `src/panfrost/lib/kmod`, which Mesa's AGENTS.md forbids AI from editing. A human has to
-   write it, or decide otherwise (`userspace/mesa/AI-POLICY.md`). **This blocks Z3 on the
-   userspace side, independent of the kernel work.**
+1. **Mesa on Windows has no JM kmod.** *Resolved 2026-10-30.* The owner made the Mesa tree a hard
+   fork (tarball + `userspace/mesa/patches/panwin-mesa.diff`, see `userspace/mesa/AI-POLICY.md`).
+   The fork builds `panfrost_kmod.c` on Windows: mmap goes through libdrm-win, perf counters fail
+   with ENOTSUP. panvk JM copies event fences with a binary SYNCOBJ_TRANSFER, which the core
+   accepts on JM for that purpose. `tests/e2e/run.sh g31` runs panvk v7 on the mock G31.
 2. **Page-table format.** Linux panfrost uses the legacy "Mali LPAE" format on the H616: its
    compatible has no `GPU_QUIRK_FORCE_AARCH64_PGTABLE`. Our core only writes AArch64 4K tables.
    The G31 advertises `HW_FEATURE_AARCH64_MMU` (panfrost_features.h), which is what Arm's kbase

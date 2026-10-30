@@ -1,5 +1,35 @@
 # Status: Mesa panvk for Windows (key `mesa`)
 
+## Update 2026-10-30: hard fork, tarball + one diff, panvk v7 on the G31
+
+This replaces the patch-series workflow described further down; the rest of the file is the
+earlier record.
+
+- **Fork.** The owner decided to treat Mesa as a hard fork locked at `MESA_COMMIT`
+  (`userspace/mesa/AI-POLICY.md`). `build.sh` downloads the gitlab source tarball of that commit
+  (sha256 `ee590de6…`, checked; its contents are identical to `git archive` of the commit), extracts
+  it to `references/mesa-panwin` and applies `patches/panwin-mesa.diff`. The 14 `.patch` files
+  are gone; `build.sh diff` exports branch `panwin` of `references/mesa-src` as the one diff, with
+  the commit messages as a `#` header. The fork deletes `AGENTS.md` and `CLAUDE.md`.
+- **Checked:** tarball + diff gives a tree identical to `git archive panwin` (`diff -r`, symlinks
+  included); a changed diff is swapped in place (reverse old, apply new) and untouched files keep
+  their timestamps.
+- **New fork commits** (17 in all, +477/-111 in 33 files):
+  - `pan/kmod: build the panfrost (JM) backend on Windows`: `panfrost_kmod.c` is built again;
+    panthor's DRM-fd mmap helpers move to `pan_kmod.h` (`pan_kmod_fd_mmap/munmap`) and serve
+    panfrost BOs too (bo_munmap op, 64-bit offsets); perf counters fail with ENOTSUP on Windows
+    (the sampling thread needs eventfd/timerfd/poll; only the perf tools use them).
+  - `panvk/jm: copy event fences with SYNCOBJ_TRANSFER on Windows`, replacing the sync_file
+    export/import round trip. The kernel core accepts binary-to-binary TRANSFER on JM for this
+    (`pw_file.c`); timeline points stay EOPNOTSUPP and DRM_CAP_SYNCOBJ_TIMELINE stays 0.
+- **panvk v7 under wine on the mock G31** (`tests/e2e/run.sh g31`, `PANWIN_CORE_MODEL=g31`,
+  `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1`): enumerates "Mali-G31 MC2" (Vulkan 1.3), creates a
+  device, and `vk_e2e` passes 12 steps and skips 2 (no timestamp queries and no sparse binding on
+  v7): submit + fence, an event set by the job chain and seen by the CPU, timeline semaphores, 1000
+  resubmits, teardown with no leaks. The only failing ioctls are SYNCOBJ_WAIT timeouts from event
+  polling. Shaders are not executed by the mock, so fill/copy results are not checked.
+- Not run: the aarch64 DLL on hardware.
+
 ## Summary
 
 Mesa's panvk now cross-compiles and links for Windows as `vulkan_panfrost.dll` plus an ICD json.

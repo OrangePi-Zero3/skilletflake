@@ -174,8 +174,28 @@ static void test_jm_dispatch(void)
 	CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &ta), PW_EOPNOTSUPP);
 	CHECK_EQ(pw_file_ioctl(e.file, _IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT), junk,
 			       sizeof(struct drm_syncobj_timeline_wait)), PW_EOPNOTSUPP);
-	CHECK_EQ(pw_file_ioctl(e.file, _IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER), junk,
-			       sizeof(struct drm_syncobj_transfer)), PW_EOPNOTSUPP);
+	/* TRANSFER only with timeline points: binary-to-binary is the Windows stand-in for a
+	 * sync_file round trip */
+	{
+		struct drm_syncobj_create sc2 = { .flags = DRM_SYNCOBJ_CREATE_SIGNALED };
+		struct drm_syncobj_transfer xt;
+		struct drm_syncobj_wait w;
+
+		CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_CREATE, &sc2), PW_OK);
+		memset(&xt, 0, sizeof(xt));
+		xt.src_handle = sc2.handle;
+		xt.dst_handle = sc.handle;
+		xt.dst_point = 1;
+		CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_TRANSFER, &xt), PW_EOPNOTSUPP);
+		xt.dst_point = 0;
+		CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_TRANSFER, &xt), PW_OK);
+		memset(&w, 0, sizeof(w));
+		w.handles = (uint64_t)(uintptr_t)&sc.handle;
+		w.count_handles = 1;
+		CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_WAIT, &w), PW_OK);	/* now signalled */
+		sd.handle = sc2.handle;
+		CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_DESTROY, &sd), PW_OK);
+	}
 	memset(&sd, 0, sizeof(sd));
 	sd.handle = sc.handle;
 	CHECK_EQ(JIOC(&e, DRM_IOCTL_SYNCOBJ_DESTROY, &sd), PW_OK);

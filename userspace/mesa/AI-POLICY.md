@@ -1,21 +1,24 @@
-# Mesa AI policy: read before using these patches
+# The Mesa fork and AI-written code
 
-Mesa's `AGENTS.md` tells AI agents not to modify `src/panfrost` and `src/gallium/drivers/panfrost`.
-It refers users to the Panfrost AI policy instead (`docs/drivers/panfrost.rst`, section
-"AI policy"). That policy asks developers not to use AI to generate patches and to write the code
-they submit themselves.
+panfrost-win's Mesa is a **hard fork** of upstream Mesa, locked at `MESA_COMMIT`. It is built
+from the source tarball of that commit (checked against `MESA_TARBALL_SHA256`) with one diff
+applied, `patches/panwin-mesa.diff`. The project owner decided this on 2026-10-30.
 
-Status of the series in `patches/`:
+Upstream Mesa asks AI agents to stay out of some directories, `src/panfrost` and
+`src/gallium/drivers/panfrost` among them (its `AGENTS.md`, and the Panfrost AI policy in
+`docs/drivers/panfrost.rst`). That policy covers code submitted to Mesa. This fork submits
+nothing, so it follows its own rules instead:
 
-- Every patch was LLM-generated and carries `Generated-by: LLM`. None may be submitted upstream as is.
-- **6 patches touch `src/panfrost` against that policy:** 0008, 0009, 0010, 0011, 0012 and 0014. They
-  are a local, working prototype that proves panvk can build and enumerate on Windows. They are
-  waiting on the project owner's decision: keep them as a private downstream prototype, or have a
-  human rewrite them.
-- 0001–0007 and 0013 touch only `src/util`, `src/vulkan` and `meson.build`. Those areas are covered by
-  the general Mesa rule: label the commits, never open MRs or post comments upstream.
+- The fork's diff deletes `AGENTS.md` (and its `CLAUDE.md` symlink). Changes anywhere in the
+  tree, `src/panfrost` included, may be LLM-written.
+- Every change is labelled: each commit on the fork branch carries `Generated-by: LLM`, and the
+  diff's header lists those commits.
+- Nothing from the fork goes to Mesa upstream. No merge requests, issues or comments on
+  gitlab.freedesktop.org/mesa, by people or agents.
+- If any of it should ever go upstream, a human rewrites it from scratch under Mesa's and
+  Panfrost's policies. This diff is not a starting point for that.
 
-Going forward, no AI-authored changes are made under `src/panfrost`. Windows-specific behaviour
-should go into layers outside it: libdrm-win, `src/util` (os_mmap, build-id), compat headers
-force-included from the cross file, and the kernel driver accepting what unmodified panvk sends.
-That way the remaining `src/panfrost` delta stays as small as possible, for a human to write.
+Before the fork, Windows behaviour was kept outside `src/panfrost` where possible (libdrm-win,
+`src/util`, compat headers, the kernel driver accepting what unmodified panvk sends). That is
+still preferred when it is the cleaner fix, because it keeps the diff small and rebasing on a
+newer Mesa cheap.

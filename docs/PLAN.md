@@ -88,6 +88,15 @@ Facts and sources: [`research/zero3-g31.md`](research/zero3-g31.md).
 - **Userspace:** panvk v7 with `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1` (non-conformant on Bifrost);
   Gallium panfrost GL through WGL later.
 
+### D5. Mesa is a hard fork, built from a tarball plus one diff
+
+Decided by the owner on 2026-10-30. The Mesa used by the project is upstream Mesa locked at
+`userspace/mesa/MESA_COMMIT`, built from that commit's source tarball (sha256-checked) with one
+diff, `userspace/mesa/patches/panwin-mesa.diff`. Nothing from it is submitted upstream, so
+upstream's agent rules (`AGENTS.md`, deleted in the fork) do not apply; changes anywhere in the
+tree, `src/panfrost` included, may be LLM-written and are labelled `Generated-by: LLM`. Details:
+`userspace/mesa/AI-POLICY.md`. Moving to a newer Mesa is a deliberate rebase, not a pin bump.
+
 ## Milestones
 
 Hardware-free work can be verified here; everything else needs the board and a UART.
@@ -96,7 +105,7 @@ Zero3 / G31 track (current):
 
 - **Z0 — hardware-free.** JM backend + panfrost uAPI in `kmd/core`, a mock G31 that executes job
   chains, panvk v7 under wine on the real core (like `tests/e2e`); `GPU0` ACPI node (done, AML
-  tested). Done except the Mesa step, see below.
+  tested). Done.
 - **Z1 — GPU alive.** Zero3 firmware with `GPU0`; panwin.sys loads (test-signed), `_PSC` 0,
   GPU_ID reads as G31, soft reset, IRQs fire. `panwin-info` prints GET_PARAM values.
 - **Z2 — first job.** Kernel-written WRITE_VALUE job on JS1, done IRQ, syncobj signalled.
@@ -110,11 +119,11 @@ and a selectable legacy Mali LPAE page-table format (`pw_jm_mem.c`), SUBMIT/JM_C
 dependencies, 500 ms timeouts and recovery (`pw_jm_sched.c`). The device reports panfrost DRM 1.5.
 The Windows glue picks the board from the ACPI HID (`AWGP0031`), checks `_PSC` before touching the
 GPU, and ships `panwin-zero3.inf`; the bring-up guide is [`bringup/zero3.md`](bringup/zero3.md).
-`tests/e2e/run.sh jm` drives the same libdrm calls Mesa's `panfrost_kmod.c` makes through
-libdrm-win into the real core under wine (527 checks, 1000-submit stress, zero leaks). Mesa itself
-is not in that test: `panfrost_kmod.c` is excluded from the Windows build (patch 0010) and
-re-enabling it is an edit under `src/panfrost`, which needs a human author (AI-POLICY.md,
-`status/jm-arch.md` open question 1). Per-piece detail and review findings:
+`tests/e2e/run.sh jm` drives the libdrm calls Mesa's `panfrost_kmod.c` makes through libdrm-win
+into the real core under wine (527 checks, 1000-submit stress, zero leaks), and
+`tests/e2e/run.sh g31` runs Mesa panvk v7 itself there: device creation, submits, events,
+timeline semaphores, 1000 resubmits, no leaks. Mesa is a hard fork (D5). Per-piece detail and
+review findings:
 `docs/status/jm-{arch,hw,mem,glue,sched,e2e}.md`.
 
 Open before or at Z1, most important first:
@@ -207,4 +216,4 @@ SYNCOBJ_EVENT takes a caller-created event handle.
    functions are ISR-safe; flush cleans to the PoC. Also add `timer_hz` to `pw_device_params` (today 24 MHz is hard-coded).
 5. **GPU `_DSM`** (edk2 patch): UUID `102bc718-f3be-4e3c-8e12-dc78892ef9a5`, functions 1 get / 2 set / 3 max / 4 diag;
    any non-zero return from "set" is a failure. The driver checks `_PSC == 0` before touching registers.
-6. **Mesa AI policy**: see [`userspace/mesa/AI-POLICY.md`](../userspace/mesa/AI-POLICY.md). Owner decision pending.
+6. **Mesa AI policy**: settled by D5 (hard fork, [`userspace/mesa/AI-POLICY.md`](../userspace/mesa/AI-POLICY.md)).

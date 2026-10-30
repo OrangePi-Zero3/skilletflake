@@ -14,8 +14,7 @@ signing already on.
 `panwin.sys` loads test-signed, ACPI `_PSC` reports 0 (powered), `GPU_ID` reads back as a
 Mali-G31, and `panwin-info` prints every `DRM_PANFROST_PARAM_*` value so we can replace the
 guessed values in the mock (table "Values to confirm" in
-[`docs/status/jm-arch.md`](../status/jm-arch.md)). Running jobs (Z2) and Mesa (Z3) come later;
-Z3 is also blocked on the userspace side (jm-arch open question 1).
+[`docs/status/jm-arch.md`](../status/jm-arch.md)). Running jobs (Z2) and Mesa (Z3) come later.
 
 What you need:
 
@@ -347,5 +346,6 @@ Also check `pnputil /restart-device "ACPI\AWGP0031\0"` and `pnputil /disable-dev
 DebugView log has no "lines masked by glue" warnings (an interrupt line that fired without a
 handler).
 
-That is Z1. Z2 (a kernel-built WRITE_VALUE job on JS1) needs the job-manager scheduler that is
-still being written; Z3 needs Mesa's panfrost kmod on Windows (jm-arch open question 1).
+That is Z1. Z2 is a kernel-built WRITE_VALUE job on JS1. Z3 is Mesa panvk v7
+(`vulkan_panfrost.dll` from `userspace/mesa/build.sh aarch64`, run with
+`PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1`); both already run against the mock G31 under wine.

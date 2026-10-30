@@ -567,6 +567,22 @@ struct pw_ioctl_desc {
 #define PW_IOCTL_F(ioctl, type, f, fl)	{ PW_NR(ioctl), 0, sizeof(type), f, 0, fl }
 #define PW_IOCTL_UNSUPPORTED(ioctl, e)	{ PW_NR(ioctl), 0, 0, NULL, e, 0 }
 
+/*
+ * SYNCOBJ_TRANSFER needs DRIVER_SYNCOBJ_TIMELINE, so Linux panfrost refuses it. On JM we accept
+ * the binary-to-binary form (both points 0): it stands in for the HANDLE_TO_FD(EXPORT_SYNC_FILE)
+ * + FD_TO_HANDLE(IMPORT_SYNC_FILE) round trip panvk uses to copy a fence between binary
+ * syncobjs, since there is no sync_file on Windows. Timeline points stay EOPNOTSUPP and
+ * DRM_CAP_SYNCOBJ_TIMELINE stays 0.
+ */
+static int ioctl_syncobj_transfer(struct pw_file *file, void *arg)
+{
+	const struct drm_syncobj_transfer *t = arg;
+
+	if (file_is_jm(file) && (t->src_point || t->dst_point))
+		return PW_EOPNOTSUPP;
+	return pw_ioctl_syncobj_transfer(file, arg);
+}
+
 /* DRM core ioctls (nr 0x00-0x3f, 0xa0-0xcf), the same for both backends. */
 static const struct pw_ioctl_desc pw_core_ioctls[] = {
 	/* DRM core (render-node subset Mesa/libdrm use) */
@@ -584,8 +600,8 @@ static const struct pw_ioctl_desc pw_core_ioctls[] = {
 		   pw_ioctl_syncobj_timeline_signal, PW_IOCTL_F_TIMELINE),
 	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_QUERY, struct drm_syncobj_timeline_array,
 		   pw_ioctl_syncobj_query, PW_IOCTL_F_TIMELINE),
-	PW_IOCTL_F(DRM_IOCTL_SYNCOBJ_TRANSFER, struct drm_syncobj_transfer,
-		   pw_ioctl_syncobj_transfer, PW_IOCTL_F_TIMELINE),
+	PW_IOCTL(DRM_IOCTL_SYNCOBJ_TRANSFER, struct drm_syncobj_transfer,
+		 ioctl_syncobj_transfer, 0),
 	/* fd-based sharing doesn't exist on Windows (pw_sync.h) */
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, PW_EOPNOTSUPP),
 	PW_IOCTL_UNSUPPORTED(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, PW_EOPNOTSUPP),

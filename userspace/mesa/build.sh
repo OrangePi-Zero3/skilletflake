@@ -3,12 +3,19 @@
 #
 # Cross-build Mesa's panvk (vulkan_panfrost.dll + ICD json) for Windows with llvm-mingw.
 #
-#   userspace/mesa/build.sh [aarch64|x86_64|all|checkout|host-tools]      (default: aarch64)
+#   userspace/mesa/build.sh [aarch64|x86_64|all|checkout|host-tools|diff]      (default: aarch64)
 #
 #   checkout    only step 1;  host-tools  steps 1-2;  all  aarch64 then x86_64
+#   diff        regenerate patches/panwin-mesa.diff from the fork's git branch ($MESA_DEV_SRC)
+#
+# The Mesa used here is a hard fork of upstream at MESA_COMMIT: the source tarball of that commit
+# (sha256 in MESA_TARBALL_SHA256) with one diff applied (patches/panwin-mesa.diff). The fork is
+# developed as branch 'panwin' of a git checkout ($MESA_DEV_SRC); `build.sh diff` exports it.
 #
 # Steps (each one is skipped when already done, so the script is idempotent):
-#   1. Mesa checkout: $MESA_SRC on branch 'panwin' = MESA_COMMIT + patches/*.patch (git am).
+#   1. Mesa source: $MESA_SRC = the tarball (downloaded once into $MESA_TARBALL_DIR, checked
+#      against MESA_TARBALL_SHA256) + patches/panwin-mesa.diff. A changed diff is swapped in
+#      place (old one reversed, new one applied) so unchanged files keep their timestamps.
 #   2. Host tools: SPIRV-LLVM-Translator matching the system LLVM, then mesa_clc, vtn_bindgen2
 #      and panfrost_compile from the same Mesa tree, installed in $HOST_TOOLS/prefix.
 #   3. libdrm: libdrm-win's install ($LIBDRM_WIN_PREFIX, default repo/out/<arm64|x86_64>);
@@ -16,8 +23,9 @@
 #   4. meson setup + ninja + meson install (stripped) into $BUILD_ROOT-<arch>/install.
 #   5. Checks: imports/exports of the DLL.
 #
-# Environment overrides: MESA_SRC, MESA_REF_CLONE, HOST_TOOLS, BUILD_ROOT, LIBDRM_WIN_PREFIX,
-# LLVM_MINGW, JOBS, MESA_BUILDTYPE, PANWIN_MESA_NO_RESET=1 (never touch the Mesa checkout).
+# Environment overrides: MESA_SRC, MESA_TARBALL_DIR, MESA_DEV_SRC, HOST_TOOLS, BUILD_ROOT,
+# LIBDRM_WIN_PREFIX, LLVM_MINGW, JOBS, MESA_BUILDTYPE, PANWIN_MESA_NO_RESET=1 (build $MESA_SRC as
+# it is, e.g. MESA_SRC=$MESA_DEV_SRC while developing the fork).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,9 +33,12 @@ repo=$(cd "$here/../.." && pwd)
 refs=$(cd "$repo/../references" && pwd)
 
 MESA_COMMIT=$(tr -d '[:space:]' < "$here/MESA_COMMIT")
-MESA_SRC=${MESA_SRC:-$refs/mesa-src}
-MESA_REF_CLONE=${MESA_REF_CLONE:-$refs/mesa}
-MESA_URL=${MESA_URL:-https://gitlab.freedesktop.org/mesa/mesa.git}
+MESA_TARBALL_SHA256=$(tr -d '[:space:]' < "$here/MESA_TARBALL_SHA256")
+MESA_TARBALL_URL=${MESA_TARBALL_URL:-https://gitlab.freedesktop.org/mesa/mesa/-/archive/$MESA_COMMIT/mesa-$MESA_COMMIT.tar.gz}
+MESA_DIFF=$here/patches/panwin-mesa.diff
+MESA_SRC=${MESA_SRC:-$refs/mesa-panwin}
+MESA_TARBALL_DIR=${MESA_TARBALL_DIR:-$refs/mesa-tarball}
+MESA_DEV_SRC=${MESA_DEV_SRC:-$refs/mesa-src}
 HOST_TOOLS=${HOST_TOOLS:-$refs/host-tools}
 BUILD_ROOT=${BUILD_ROOT:-$refs/mesa-build}
 LLVM_MINGW=${LLVM_MINGW:-/opt/llvm-mingw}
@@ -37,60 +48,95 @@ MESA_BUILDTYPE=${MESA_BUILDTYPE:-release}
 log() { printf '\n=== %s\n' "$*"; }
 die() { printf 'build.sh: error: %s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------- 1. Mesa checkout
-series_subjects() {
-	local p
-	for p in "$here"/patches/*.patch; do
-		[ -e "$p" ] || continue
-		# Subject header, unfolded (format-patch wraps long subjects).
-		awk '/^Subject: /{s=$0; f=1; next} f && /^[ \t]/{s=s $0; next} f{exit} END{
-			sub(/^Subject: (\[PATCH[^]]*\] )?/, "", s); gsub(/[ \t]+/, " ", s); print s}' "$p"
-	done
+# ---------------------------------------------------------------- 1. Mesa source
+fetch_tarball() {
+	local tb="$MESA_TARBALL_DIR/mesa-$MESA_COMMIT.tar.gz"
+	if [ ! -f "$tb" ]; then
+		mkdir -p "$MESA_TARBALL_DIR"
+		log "Mesa tarball: $MESA_TARBALL_URL"
+		curl -fSL --retry 3 -o "$tb.part" "$MESA_TARBALL_URL"
+		mv "$tb.part" "$tb"
+	fi
+	echo "$MESA_TARBALL_SHA256  $tb" | sha256sum -c --quiet - ||
+		die "$tb does not match MESA_TARBALL_SHA256 (delete it to download again)"
+	TARBALL=$tb
 }
 
 checkout_mesa() {
-	log "Mesa source: $MESA_SRC @ $MESA_COMMIT + $(ls "$here"/patches/*.patch 2>/dev/null | wc -l) patches"
-	if [ ! -e "$MESA_SRC/.git" ]; then
-		if [ -d "$MESA_REF_CLONE/.git" ]; then
-			git -C "$MESA_REF_CLONE" cat-file -e "$MESA_COMMIT^{commit}" 2>/dev/null ||
-				git -C "$MESA_REF_CLONE" fetch --filter=blob:none origin "$MESA_COMMIT"
-			git -C "$MESA_REF_CLONE" worktree add --detach "$MESA_SRC" "$MESA_COMMIT"
-		else
-			git clone --filter=blob:none --no-checkout "$MESA_URL" "$MESA_SRC"
-			git -C "$MESA_SRC" checkout --detach "$MESA_COMMIT"
-		fi
-	fi
-	[ "${PANWIN_MESA_NO_RESET:-0}" = 1 ] && { echo "PANWIN_MESA_NO_RESET=1: using the checkout as is"; return; }
-
-	git -C "$MESA_SRC" cat-file -e "$MESA_COMMIT^{commit}" 2>/dev/null ||
-		git -C "$MESA_SRC" fetch --filter=blob:none origin "$MESA_COMMIT"
-
-	# Already applied? Compare the commit subjects on top of the pin with the series.
-	local have want
-	have=$(git -C "$MESA_SRC" log --reverse --format=%s "$MESA_COMMIT..HEAD" 2>/dev/null || true)
-	want=$(series_subjects)
-	if git -C "$MESA_SRC" merge-base --is-ancestor "$MESA_COMMIT" HEAD 2>/dev/null &&
-	   [ "$have" = "$want" ]; then
-		echo "series already applied (branch $(git -C "$MESA_SRC" rev-parse --abbrev-ref HEAD))"
+	[ "${PANWIN_MESA_NO_RESET:-0}" = 1 ] && {
+		log "Mesa source: $MESA_SRC as it is (PANWIN_MESA_NO_RESET=1)"
+		return
+	}
+	[ -f "$MESA_DIFF" ] || die "$MESA_DIFF missing"
+	local stamp="$MESA_SRC/.panwin-source" applied="$MESA_SRC/.panwin-mesa.diff"
+	local want
+	want="$MESA_COMMIT $MESA_TARBALL_SHA256 $(sha256sum < "$MESA_DIFF" | cut -d' ' -f1)"
+	log "Mesa source: $MESA_SRC = tarball $MESA_COMMIT + $(basename "$MESA_DIFF")"
+	if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+		echo "up to date"
 		return
 	fi
-	git -C "$MESA_SRC" diff --quiet && git -C "$MESA_SRC" diff --cached --quiet ||
-		die "$MESA_SRC has uncommitted changes; commit/stash them or set PANWIN_MESA_NO_RESET=1"
-	# Branch 'panwin', unless another worktree of the same repository has it checked out.
-	local br=${PANWIN_BRANCH:-panwin} top
-	top=$(cd "$MESA_SRC" && pwd -P)
-	if git -C "$MESA_SRC" worktree list --porcelain |
-	   awk -v b="branch refs/heads/$br" -v t="worktree $top" '/^worktree /{w=$0} $0==b && w!=t {f=1} END{exit !f}'; then
-		echo "branch $br is checked out in another worktree; applying the series detached"
-		git -C "$MESA_SRC" checkout -q --detach "$MESA_COMMIT"
-	else
-		git -C "$MESA_SRC" checkout -q -B "$br" "$MESA_COMMIT"
+	if [ -e "$MESA_SRC" ] && [ ! -f "$stamp" ]; then
+		die "$MESA_SRC exists but was not made by this script; remove it, or build it as it is with PANWIN_MESA_NO_RESET=1"
 	fi
-	if ls "$here"/patches/*.patch >/dev/null 2>&1; then
-		git -C "$MESA_SRC" -c user.name="${GIT_COMMITTER_NAME:-panfrost-win build}" \
-			-c user.email="${GIT_COMMITTER_EMAIL:-panfrost-win@localhost}" \
-			am -q --committer-date-is-author-date "$here"/patches/*.patch
+
+	# Same tarball, new diff: reverse the old diff and apply the new one in place.
+	if [ -f "$stamp" ] && [ -f "$applied" ] &&
+	   [ "$(cut -d' ' -f1-2 "$stamp")" = "$MESA_COMMIT $MESA_TARBALL_SHA256" ] &&
+	   patch -d "$MESA_SRC" -p1 -R -s --dry-run -f < "$applied" >/dev/null &&
+	   patch -d "$MESA_SRC" -p1 -R -s -f --no-backup-if-mismatch < "$applied"; then
+		if patch -d "$MESA_SRC" -p1 -s -f --dry-run < "$MESA_DIFF" >/dev/null; then
+			patch -d "$MESA_SRC" -p1 -s -f --no-backup-if-mismatch < "$MESA_DIFF"
+			cp "$MESA_DIFF" "$applied"
+			echo "$want" > "$stamp"
+			echo "diff updated in place"
+			return
+		fi
+		die "$(basename "$MESA_DIFF") does not apply to the $MESA_COMMIT tarball"
 	fi
+
+	# From scratch.
+	fetch_tarball
+	local tmp="$MESA_SRC.tmp"
+	rm -rf "$tmp"
+	mkdir -p "$tmp"
+	tar -xzf "$TARBALL" -C "$tmp" --strip-components=1
+	patch -d "$tmp" -p1 -s -f --no-backup-if-mismatch < "$MESA_DIFF" ||
+		die "$(basename "$MESA_DIFF") does not apply to the $MESA_COMMIT tarball"
+	cp "$MESA_DIFF" "$tmp/.panwin-mesa.diff"
+	echo "$want" > "$tmp/.panwin-source"
+	rm -rf "$MESA_SRC"
+	mv "$tmp" "$MESA_SRC"
+}
+
+# Export branch 'panwin' of the fork's git checkout as the one diff, with the commit log as a
+# '#' comment header (patch ignores it).
+export_diff() {
+	local br=${PANWIN_BRANCH:-panwin}
+	[ -e "$MESA_DEV_SRC/.git" ] || die "$MESA_DEV_SRC is not a git checkout of the fork"
+	git -C "$MESA_DEV_SRC" merge-base --is-ancestor "$MESA_COMMIT" "$br" ||
+		die "branch $br of $MESA_DEV_SRC is not based on $MESA_COMMIT"
+	git -C "$MESA_DEV_SRC" diff --quiet && git -C "$MESA_DEV_SRC" diff --cached --quiet ||
+		echo "build.sh: note: $MESA_DEV_SRC has uncommitted changes, they are not exported" >&2
+	{
+		cat <<-EOF
+		# panfrost-win's Mesa: a hard fork of Mesa at $MESA_COMMIT.
+		#
+		# Apply to the source tarball of that commit (userspace/mesa/MESA_TARBALL_SHA256):
+		#   tar -xzf mesa-$MESA_COMMIT.tar.gz && cd mesa-$MESA_COMMIT && patch -p1 < panwin-mesa.diff
+		# userspace/mesa/build.sh does this. Generated by 'build.sh diff' from branch $br; do not
+		# edit by hand. The changes are LLM-written (Generated-by: LLM) and are not for Mesa
+		# upstream; see userspace/mesa/AI-POLICY.md.
+		#
+		# Commits:
+		EOF
+		git -C "$MESA_DEV_SRC" log --reverse --no-merges --format='%s%n%n%b%n' "$MESA_COMMIT..$br" |
+			sed -e 's/^/#   /' -e 's/[[:space:]]*$//'
+		git -C "$MESA_DEV_SRC" diff --no-color --no-renames --no-ext-diff "$MESA_COMMIT" "$br"
+	} > "$MESA_DIFF.tmp"
+	mv "$MESA_DIFF.tmp" "$MESA_DIFF"
+	git -C "$MESA_DEV_SRC" diff --shortstat "$MESA_COMMIT" "$br"
+	echo "wrote $MESA_DIFF"
 }
 
 # ---------------------------------------------------------------- 2. host tools
@@ -194,6 +240,11 @@ build_mesa() {
 		rm -rf "$bdir/build"
 	fi
 	echo "$LIBDRM_PREFIX" > "$bdir/.libdrm-prefix"
+	# ...and when the Mesa source tree moves (e.g. git checkout -> tarball tree).
+	if [ -f "$bdir/build/build.ninja" ] && [ "$(cat "$bdir/.mesa-src" 2>/dev/null)" != "$MESA_SRC" ]; then
+		rm -rf "$bdir/build"
+	fi
+	echo "$MESA_SRC" > "$bdir/.mesa-src"
 
 	log "Mesa: configure $arch ($bdir/build)"
 	local opts=(
@@ -246,7 +297,8 @@ check_dll() {
 what=${1:-aarch64}
 case $what in
 aarch64|x86_64|all|checkout|host-tools) ;;
-*) die "usage: $0 [aarch64|x86_64|all|checkout|host-tools]" ;;
+diff) export_diff; exit 0 ;;
+*) die "usage: $0 [aarch64|x86_64|all|checkout|host-tools|diff]" ;;
 esac
 [ -x "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang" ] || die "llvm-mingw not found at $LLVM_MINGW"
 

@@ -7,23 +7,27 @@
 #   csf: Mesa panvk (vulkan_panfrost.dll) -> libdrm-win (libdrm.dll) -> in-process kmd/core
 #        + mock G610 (kmd/tests/pw_os_mock.c, mock_csf.c) booting the real mali_csffw.bin
 #   jm:  (jm-e2e) userspace/libdrm-win/tests/test_libdrm_jm.c -> libdrm.dll -> kmd/core JM backend
-#        + mock G31 (kmd/tests/mock_jm.c), PANWIN_CORE_MODEL=g31. No Mesa: Mesa's panfrost kmod
-#        is not built for Windows yet (docs/status/jm-arch.md open question 1), so the test makes
-#        the libdrm calls Mesa's panfrost_kmod.c / panvk JM / Gallium pan_jm.c would make.
+#        + mock G31 (kmd/tests/mock_jm.c), PANWIN_CORE_MODEL=g31. No Mesa: the libdrm calls
+#        Mesa's panfrost_kmod.c / panvk JM / Gallium pan_jm.c make, with errno and fault checks.
+#   g31: Mesa panvk v7 -> libdrm.dll -> kmd/core JM backend + mock G31 (PANWIN_CORE_MODEL=g31,
+#        PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1: panvk refuses v7 without it).
 #
-#   tests/e2e/run.sh                 build what is missing, then run every step
-#   tests/e2e/run.sh --rebuild       also force libdrm-win (core) and Mesa to rebuild
-#   tests/e2e/run.sh [--rebuild] jm  only the libdrm-win build + the jm step (no Mesa needed)
-#   tests/e2e/run.sh [--rebuild] csf only the libdrm-win build + the CSF/Mesa steps
+#   tests/e2e/run.sh                  build what is needed, then run every step
+#   tests/e2e/run.sh --rebuild        also force libdrm-win (core) and Mesa to rebuild from clean
+#   tests/e2e/run.sh [--rebuild] jm   only the libdrm-win build + the jm step (no Mesa needed)
+#   tests/e2e/run.sh [--rebuild] csf  only the libdrm-win build + Mesa on the G610
+#   tests/e2e/run.sh [--rebuild] g31  only the libdrm-win build + Mesa on the G31
 #
 # Steps:
 #   1. libdrm-win with -Dcore_transport=true -> out/x86_64-core (+ its meson tests: libdrm_core
 #      (CS-level checks on the G610), libdrm_core_g31 and libdrm_jm (G31), libdrm_fake, ioctl_map)
 #   jm. out/e2e-jm-x86_64/: the core libdrm.dll + test_libdrm_jm.exe, run under wine
-#   csf 2. Mesa x86_64 (userspace/mesa/build.sh, debugoptimized = asserts on) linked against it,
-#      in $E2E_MESA_BUILD_ROOT-x86_64 (default references/mesa-build-e2e-x86_64)
-#   csf 3. out/e2e-x86_64/: vulkan_panfrost.dll + the core libdrm.dll + vk_e2e.exe + icd_smoke.exe
-#   csf 4. wine: vk_e2e.exe (tests/e2e/vk_e2e.c) and Mesa's icd_smoke (--create-device)
+#   2. (csf, g31) Mesa x86_64 (userspace/mesa/build.sh: the Mesa tarball + panwin-mesa.diff,
+#      debugoptimized = asserts on) linked against it, in $E2E_MESA_BUILD_ROOT-x86_64 (default
+#      references/mesa-build-e2e-x86_64). Incremental: build.sh is idempotent.
+#   3. out/e2e-x86_64/: vulkan_panfrost.dll + the core libdrm.dll + vk_e2e.exe + icd_smoke.exe
+#   csf, g31. wine: vk_e2e.exe (tests/e2e/vk_e2e.c) and Mesa's icd_smoke (--create-device), on
+#      the mock G610 or the mock G31
 # Environment: E2E_MESA_BUILD_ROOT, MESA_SRC, LLVM_MINGW, PANWIN_CORE_FW, WINEDEBUG, PANVK_DEBUG,
 #   PANWIN_JM_STRESS (jm step: number of stress submits, default 1000).
 set -euo pipefail
@@ -32,22 +36,25 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 refs=$(cd "$repo/../references" && pwd)
 LLVM_MINGW=${LLVM_MINGW:-/opt/llvm-mingw}
-MESA_SRC=${MESA_SRC:-$refs/mesa-src}
+MESA_SRC=${MESA_SRC:-$refs/mesa-panwin}	# what userspace/mesa/build.sh makes
 E2E_MESA_BUILD_ROOT=${E2E_MESA_BUILD_ROOT:-$refs/mesa-build-e2e}
 rebuild=0
 do_csf=0
 do_jm=0
+do_g31=0
 for a in "$@"; do
 	case "$a" in
 	--rebuild) rebuild=1 ;;
 	csf) do_csf=1 ;;
 	jm) do_jm=1 ;;
-	*) echo "usage: $0 [--rebuild] [csf] [jm]" >&2; exit 2 ;;
+	g31) do_g31=1 ;;
+	*) echo "usage: $0 [--rebuild] [csf] [jm] [g31]" >&2; exit 2 ;;
 	esac
 done
-if [ $do_csf = 0 ] && [ $do_jm = 0 ]; then
+if [ $do_csf = 0 ] && [ $do_jm = 0 ] && [ $do_g31 = 0 ]; then
 	do_csf=1
 	do_jm=1
+	do_g31=1
 fi
 
 log() { printf '\n=== %s\n' "$*"; }
@@ -87,16 +94,15 @@ if [ $do_jm = 1 ]; then
 	results="$results jm=$([ $jrc = 0 ] && echo PASS || echo FAIL)"
 fi
 
-# ---- csf: Mesa panvk on the G610
-if [ $do_csf = 1 ]; then
+# ---- Mesa panvk (csf, g31)
+if [ $do_csf = 1 ] || [ $do_g31 = 1 ]; then
 	# ---- 2. Mesa against it
 	mesa_bin="$E2E_MESA_BUILD_ROOT-x86_64/install/bin"
-	if [ "$rebuild" = 1 ] || [ ! -f "$mesa_bin/vulkan_panfrost.dll" ]; then
-		log "Mesa x86_64 (debugoptimized) against $prefix"
-		LIBDRM_WIN_PREFIX="$prefix" BUILD_ROOT="$E2E_MESA_BUILD_ROOT" \
-			MESA_BUILDTYPE=${MESA_BUILDTYPE:-debugoptimized} MESA_SRC="$MESA_SRC" \
-			"$repo/userspace/mesa/build.sh" x86_64
-	fi
+	log "Mesa x86_64 (debugoptimized) against $prefix"
+	[ "$rebuild" = 1 ] && rm -rf "$E2E_MESA_BUILD_ROOT-x86_64/build"
+	LIBDRM_WIN_PREFIX="$prefix" BUILD_ROOT="$E2E_MESA_BUILD_ROOT" \
+		MESA_BUILDTYPE=${MESA_BUILDTYPE:-debugoptimized} MESA_SRC="$MESA_SRC" \
+		"$repo/userspace/mesa/build.sh" x86_64
 
 	# ---- 3. run directory
 	run="$repo/out/e2e-x86_64"
@@ -108,8 +114,10 @@ if [ $do_csf = 1 ]; then
 		-o "$run/vk_e2e.exe" "$here/vk_e2e.c"
 	"$cc" -O1 -Wall -I"$MESA_SRC/include" -o "$run/icd_smoke.exe" \
 		"$repo/userspace/mesa/tests/icd_smoke.c"
+fi
 
-	# ---- 4. run
+# ---- csf: Mesa panvk on the G610
+if [ $do_csf = 1 ]; then
 	crc=0
 	log "vk_e2e (Vulkan flow on panvk -> libdrm-win -> kmd/core + mock G610)"
 	(cd "$run" && PANWIN_CORE_REPORT=1 wine ./vk_e2e.exe vulkan_panfrost.dll) || crc=1
@@ -118,6 +126,20 @@ if [ $do_csf = 1 ]; then
 		wine ./icd_smoke.exe vulkan_panfrost.dll --require-device --create-device) || crc=1
 	[ $crc = 0 ] || rc=1
 	results="$results csf=$([ $crc = 0 ] && echo PASS || echo FAIL)"
+fi
+
+# ---- g31: Mesa panvk v7 on the G31
+if [ $do_g31 = 1 ]; then
+	grc=0
+	g31_env=(PANWIN_CORE_MODEL=g31 PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 PANWIN_CORE_REPORT=1)
+	log "vk_e2e (Vulkan flow on panvk v7 -> libdrm-win -> kmd/core JM + mock G31)"
+	(cd "$run" && env "${g31_env[@]}" PANWIN_E2E_GPU=Mali-G31 \
+		wine ./vk_e2e.exe vulkan_panfrost.dll) || grc=1
+	log "Mesa icd_smoke --require-device --create-device on the mock G31"
+	(cd "$run" && env "${g31_env[@]}" \
+		wine ./icd_smoke.exe vulkan_panfrost.dll --require-device --create-device) || grc=1
+	[ $grc = 0 ] || rc=1
+	results="$results g31=$([ $grc = 0 ] && echo PASS || echo FAIL)"
 fi
 
 log "e2e: $([ $rc = 0 ] && echo PASS || echo FAIL) ($results )"

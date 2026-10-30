@@ -9,7 +9,8 @@
  * Steps (each one prints "STEP n <name>: PASS|FAIL ..."; the run stops at the first failure
  * that makes the rest meaningless, and the summary says how far it got):
  *   1 instance            vkCreateInstance (API 1.3)
- *   2 enumerate           exactly one physical device, name contains "Mali-G610"
+ *   2 enumerate           exactly one physical device, name contains "Mali-G610" (or
+ *                         $PANWIN_E2E_GPU: "Mali-G31" on the mock G31, PANWIN_CORE_MODEL=g31)
  *   3 device              vkCreateDevice with every queue of every family + timelineSemaphore
  *   4 memory              allocate / map / bind host-visible memory for two buffers
  *   5 record              vkCmdFillBuffer + vkCmdCopyBuffer + vkCmdSetEvent (CS-only)
@@ -29,6 +30,8 @@
  *  12 every-queue         an empty submit + fence on every created queue
  *  13 idle               vkDeviceWaitIdle
  *  14 teardown           destroy everything, then the core transport reports no leaks
+ * Steps for features the device doesn't advertise (8 without timestampValidBits, 9 without
+ * sparseBinding: panvk v7 on the G31) print SKIP and count as passing.
  * Fill/copy results are printed for information only: panvk implements them with compute
  * shaders and the mock executes RUN_COMPUTE as a no-op.
  */
@@ -57,12 +60,13 @@ static int last_step, failed;
 #define NSTEPS 14
 static int nstep;
 
+/* ok: 1 PASS, 0 FAIL, -1 SKIP (the device doesn't advertise the feature; counts as passing) */
 static int step(const char *name, int ok, const char *fmt, ...)
 {
 	va_list ap;
 	int n = ++nstep;
 
-	printf("STEP %2d %-13s: %s", n, name, ok ? "PASS" : "FAIL");
+	printf("STEP %2d %-13s: %s", n, name, ok < 0 ? "SKIP" : ok ? "PASS" : "FAIL");
 	if (fmt) {
 		printf("  ");
 		va_start(ap, fmt);
@@ -164,7 +168,8 @@ int main(int argc, char **argv)
 		pd = pds[0];
 		vkGetPhysicalDeviceProperties(pd, &props);
 	}
-	if (!step("enumerate", res == VK_SUCCESS && npd == 1 && strstr(props.deviceName, "Mali-G610"),
+	const char *want_gpu = getenv("PANWIN_E2E_GPU") ? getenv("PANWIN_E2E_GPU") : "Mali-G610";
+	if (!step("enumerate", res == VK_SUCCESS && npd == 1 && strstr(props.deviceName, want_gpu),
 		  "%u device(s): \"%s\", API %u.%u.%u, vendor 0x%x device 0x%x", npd,
 		  props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
 		  VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
@@ -364,13 +369,14 @@ int main(int argc, char **argv)
 	       "(0x10000000 if compute ran): RUN_COMPUTE is a no-op in the mock\n",
 	       map[1][0], map[1][1024]);
 
-	/* ---- 8 timestamp query (CS-only) ---- */
+	/* ---- 8 timestamp query (CS-only; panvk v6/v7 have none: timestampValidBits 0) ---- */
 	VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
 				       .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
 	VkQueryPool qp = VK_NULL_HANDLE;
 	VkCommandBuffer cbq = VK_NULL_HANDLE;
-	VkResult qres = vkCreateQueryPool(dev, &qpci, NULL, &qp), qsub = VK_ERROR_UNKNOWN,
-		 qget = VK_ERROR_UNKNOWN;
+	const int have_ts = qfp[0].timestampValidBits != 0;
+	VkResult qres = have_ts ? vkCreateQueryPool(dev, &qpci, NULL, &qp) : VK_ERROR_FEATURE_NOT_PRESENT,
+		 qsub = VK_ERROR_UNKNOWN, qget = VK_ERROR_UNKNOWN;
 	uint64_t qr[4] = { 0 };
 	cbai.commandBufferCount = 1;
 	if (qres == VK_SUCCESS && vkAllocateCommandBuffers(dev, &cbai, &cbq) == VK_SUCCESS) {
@@ -390,11 +396,15 @@ int main(int argc, char **argv)
 						     VK_QUERY_RESULT_64_BIT |
 						     VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
 	}
-	step("ts-query", qsub == VK_SUCCESS && qget == VK_NOT_READY && qr[0] && qr[1] == 1 &&
-			    qr[3] == 0,
-	     "submit+wait %d, results %d (want NOT_READY=%d: query 1 never written), q0 = %llu "
-	     "avail %llu, q1 avail %llu", qsub, qget, VK_NOT_READY, (unsigned long long)qr[0],
-	     (unsigned long long)qr[1], (unsigned long long)qr[3]);
+	if (!have_ts)
+		step("ts-query", -1, "timestampValidBits 0 on family 0");
+	else
+		step("ts-query", qsub == VK_SUCCESS && qget == VK_NOT_READY && qr[0] &&
+				 qr[1] == 1 && qr[3] == 0,
+		     "submit+wait %d, results %d (want NOT_READY=%d: query 1 never written), "
+		     "q0 = %llu avail %llu, q1 avail %llu", qsub, qget, VK_NOT_READY,
+		     (unsigned long long)qr[0], (unsigned long long)qr[1],
+		     (unsigned long long)qr[3]);
 
 	/* ---- 9 sparse binding on the bind queue ---- */
 	{
@@ -441,10 +451,13 @@ int main(int argc, char **argv)
 					b2 = vkWaitForFences(dev, 1, &fence, VK_TRUE, 5000000000ull);
 			}
 		}
-		step("sparse-bind", b1 == VK_SUCCESS && b2 == VK_SUCCESS,
-		     "sparseBinding %s, bind family %d, %llu KiB: bind+fence %d, unbind+fence %d",
-		     sparse ? "yes" : "no", bfam == UINT32_MAX ? -1 : (int)bfam,
-		     (unsigned long long)smr.size / 1024, b1, b2);
+		if (!sparse)
+			step("sparse-bind", -1, "sparseBinding not advertised");
+		else
+			step("sparse-bind", b1 == VK_SUCCESS && b2 == VK_SUCCESS,
+			     "sparseBinding yes, bind family %d, %llu KiB: bind+fence %d, "
+			     "unbind+fence %d", bfam == UINT32_MAX ? -1 : (int)bfam,
+			     (unsigned long long)smr.size / 1024, b1, b2);
 		if (sbuf)
 			vkDestroyBuffer(dev, sbuf, NULL);
 		if (smem)
