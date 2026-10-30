@@ -1,0 +1,10 @@
+build*/
+*.o
+*.obj
+*.sys
+*.dll
+*.exe
+*.pdb
+*.a
+!toolchain/lib/*.def
+/out/
