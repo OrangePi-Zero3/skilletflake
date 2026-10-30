@@ -32,6 +32,23 @@ struct pw_os; /* opaque, owned by the OS layer */
 #define PW_ENOSYS   -38
 #define PW_ETIMEDOUT -110
 #define PW_EOPNOTSUPP -95
+#define PW_EINTR     -4
+#define PW_EAGAIN   -11
+#define PW_EACCES   -13
+#define PW_EEXIST   -17
+#define PW_ENOTTY   -25
+#define PW_ETIME    -62
+#define PW_EOVERFLOW -75
+#define PW_ECANCELED -125
+
+/*
+ * Execution context rules:
+ *  - ISR-safe (any IRQL, no blocking): pw_os_reg_read32/write32, pw_os_udelay, pw_os_time_ns.
+ *    Everything else is passive level only (events/mutexes/work/alloc/log may block or page).
+ *  - pw_os_copy_{from,to}_user() only from pw_file_ioctl() in the calling thread's context.
+ *  - Register writes are not implicitly ordered against normal-memory writes: use pw_wmb()
+ *    before a doorbell write that publishes shared-memory updates.
+ */
 
 /* ---- MMIO (GPU register window, offset relative to the GPU base, e.g. 0xFB000000 on RK3588) ---- */
 uint32_t pw_os_reg_read32(struct pw_os *os, uint32_t offset);
@@ -39,7 +56,9 @@ void     pw_os_reg_write32(struct pw_os *os, uint32_t offset, uint32_t value);
 /* 64-bit registers are LO/HI pairs on Mali; core composes them from 32-bit accesses. */
 
 /* ---- time ---- */
-uint64_t pw_os_time_ns(struct pw_os *os);               /* monotonic */
+/* Monotonic. On Windows it is QueryPerformanceCounter-based: the same clock as Mesa's
+ * os_time_get_nano(), so absolute syncobj deadlines from userspace compare directly. */
+uint64_t pw_os_time_ns(struct pw_os *os);
 void     pw_os_udelay(struct pw_os *os, uint32_t us);   /* busy wait, any IRQL */
 void     pw_os_msleep(struct pw_os *os, uint32_t ms);   /* may sleep, passive level only */
 
@@ -75,6 +94,7 @@ void      pw_os_mem_free(struct pw_os *os, struct pw_os_mem *mem);
 size_t    pw_os_mem_size(const struct pw_os_mem *mem);
 void     *pw_os_mem_kva(const struct pw_os_mem *mem);              /* NULL unless PW_MEM_KMAP */
 uint64_t  pw_os_mem_page_pa(const struct pw_os_mem *mem, size_t page_index); /* 4 KiB pages */
+/* flush = clean to the Point of Coherency; invalidate = invalidate (clean+invalidate) to PoC. */
 void      pw_os_mem_flush(struct pw_os *os, struct pw_os_mem *mem, size_t offset, size_t size);
 void      pw_os_mem_invalidate(struct pw_os *os, struct pw_os_mem *mem, size_t offset, size_t size);
 
@@ -85,14 +105,40 @@ void pw_os_mutex_destroy(struct pw_os *os, struct pw_os_mutex *m);
 void pw_os_mutex_lock(struct pw_os_mutex *m);
 void pw_os_mutex_unlock(struct pw_os_mutex *m);
 
-/* ---- events (for "wait until IRQ bottom half saw X") ---- */
+/* ---- events (for "wait until IRQ bottom half saw X") ----
+ * Manual-reset: a signalled event stays signalled until pw_os_event_reset(). */
+#define PW_WAIT_FOREVER 0xFFFFFFFFu
 struct pw_os_event;
 struct pw_os_event *pw_os_event_create(struct pw_os *os);
 void pw_os_event_destroy(struct pw_os *os, struct pw_os_event *e);
 void pw_os_event_signal(struct pw_os_event *e);
 void pw_os_event_reset(struct pw_os_event *e);
-/* Returns PW_OK or PW_ETIMEDOUT. */
+/* Returns PW_OK or PW_ETIMEDOUT. timeout_ms == PW_WAIT_FOREVER waits forever. */
 int  pw_os_event_wait(struct pw_os_event *e, uint32_t timeout_ms);
+/* Wait on behalf of a user ioctl: absolute deadline on the pw_os_time_ns() clock (UINT64_MAX =
+ * forever). Returns PW_OK, PW_ETIMEDOUT, or PW_EINTR if the calling thread is being terminated /
+ * alerted (Windows: UserMode alertable wait returning STATUS_USER_APC/ALERTED). */
+int  pw_os_event_wait_user(struct pw_os_event *e, uint64_t deadline_ns);
+
+/* ---- user memory (ioctl caller context only). PW_OK or PW_EFAULT. ---- */
+int pw_os_copy_from_user(struct pw_os *os, void *dst, uint64_t user_ptr, size_t size);
+int pw_os_copy_to_user(struct pw_os *os, uint64_t user_ptr, const void *src, size_t size);
+
+/*
+ * ---- deferred work (passive level, may sleep) ----
+ * queue: if not pending, schedule it; if already pending, no-op; if currently running, it runs
+ * once more afterwards. queue_delayed: same, but not before delay_ms (an already-pending
+ * immediate run is not delayed). flush: wait until neither pending nor running.
+ * destroy: cancels a pending delayed run, flushes, frees; the caller guarantees nobody queues it
+ * again. The callback may re-queue its own work item.
+ */
+struct pw_os_work;
+typedef void (*pw_os_work_fn)(void *ctx);
+struct pw_os_work *pw_os_work_create(struct pw_os *os, pw_os_work_fn fn, void *ctx);
+void pw_os_work_queue(struct pw_os_work *w);
+void pw_os_work_queue_delayed(struct pw_os_work *w, uint32_t delay_ms);
+void pw_os_work_flush(struct pw_os_work *w);
+void pw_os_work_destroy(struct pw_os *os, struct pw_os_work *w);
 
 /* ---- firmware file (e.g. "arm/mali/arch10.8/mali_csffw.bin") ---- */
 int  pw_os_firmware_load(struct pw_os *os, const char *name, const void **data, size_t *size);

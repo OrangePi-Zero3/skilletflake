@@ -44,5 +44,8 @@ extern const struct test_case util_tests[];
 extern const struct test_case fw_parse_tests[];
 extern const struct test_case mmu_tests[];
 extern const struct test_case device_tests[];
+extern const struct test_case mem_tests[];
+extern const struct test_case sync_tests[];
+extern const struct test_case sched_tests[];
 
 #endif /* PW_TEST_H */

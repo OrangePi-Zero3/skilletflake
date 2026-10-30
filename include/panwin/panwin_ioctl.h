@@ -12,9 +12,18 @@
  * __u64, so the layout is identical on aarch64 Linux and ARM64 Windows). Nested user pointers
  * inside the struct (arrays of syncs, query buffers, ...) are user-mode VAs of the calling
  * process; the kernel probes and copies them in the caller's context.
- * The kernel returns Linux errno semantics: the DeviceIoControl fails and GetLastError() is
- * mapped by the shim from the NTSTATUS (see panwin_status_to_errno() in libdrm-win), and the exact
- * negative errno is also reported in the output's trailing panwin_ioctl_status when present.
+ * Errors: a failing DRM ioctl completes with NTSTATUS PANWIN_STATUS_FROM_ERRNO(errno), a
+ * customer-defined error status carrying the exact Linux errno (so ETIME vs ETIMEDOUT etc. survive);
+ * libdrm-win decodes it with PANWIN_STATUS_TO_ERRNO(). Other NTSTATUS failures (e.g. from the I/O
+ * manager: invalid handle, access denied, buffer too small) are mapped generically by the shim.
+ * The output buffer is copied back on success only.
+ *
+ * Time: every absolute timeout in forwarded structs (drm_syncobj_wait.timeout_nsec, ...) is in
+ * nanoseconds on the QueryPerformanceCounter clock (Mesa's os_time_get_nano() on Windows).
+ *
+ * mmap offsets: the user MMIO (LATEST_FLUSH_ID) page is accepted at both
+ * DRM_PANTHOR_USER_MMIO_OFFSET_32BIT (1<<43, what Mesa computes on Windows: unsigned long is
+ * 32-bit) and DRM_PANTHOR_USER_MMIO_OFFSET_64BIT (1<<56).
  *
  * Private (Windows-only) ioctls replace POSIX facilities that don't exist on Windows:
  * mmap of BOs / the user MMIO page, poll-able syncobj events, driver info.
@@ -55,7 +64,15 @@
 #define PANWIN_IOCTL_SYNCOBJ_EVENT   PANWIN_CTL_CODE(0x903)
 #define PANWIN_IOCTL_DEBUG_REG_READ  PANWIN_CTL_CODE(0x9F0) /* debug builds of panwin.sys only */
 
-#define PANWIN_ABI_VERSION 1u
+#define PANWIN_ABI_VERSION 2u
+
+/* Severity=error (0xC), Customer=1 (0x2): 0xE...; facility 0xD52; code = Linux errno (1..4095). */
+#define PANWIN_STATUS_FACILITY  0xD52u
+#define PANWIN_STATUS_FROM_ERRNO(e) \
+	((int32_t)(0xE0000000u | (PANWIN_STATUS_FACILITY << 16) | ((uint32_t)(e) & 0xFFFu)))
+#define PANWIN_STATUS_IS_ERRNO(st) \
+	(((uint32_t)(st) & 0xFFFF0000u) == (0xE0000000u | (PANWIN_STATUS_FACILITY << 16)))
+#define PANWIN_STATUS_TO_ERRNO(st)  ((int)((uint32_t)(st) & 0xFFFu))
 
 struct panwin_info {
 	uint32_t abi_version;     /* out: PANWIN_ABI_VERSION */
@@ -90,14 +107,17 @@ struct panwin_munmap {
 };
 
 /*
- * poll()/eventfd replacement: returns a Win32 event HANDLE (valid in the caller's process) that
- * the kernel signals when syncobj `handle` reaches `point` (0 = binary syncobj signalled). One-shot.
+ * poll()/eventfd replacement: the caller creates a Win32 event (CreateEvent) and passes its HANDLE;
+ * the kernel references it and sets it once syncobj `handle` has a signalled fence for `point`
+ * (0 = binary). One-shot; the caller keeps ownership of the handle. Pending registrations are
+ * dropped when the device handle is closed. Without DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT a
+ * syncobj with no fence for `point` fails with EINVAL.
  */
 struct panwin_syncobj_event {
 	uint32_t handle;      /* in: syncobj handle */
 	uint32_t flags;       /* in: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT etc. */
 	uint64_t point;       /* in */
-	uint64_t event_handle;/* out: HANDLE */
+	uint64_t event_handle;/* in: HANDLE of a caller-created event (EVENT_MODIFY_STATE access) */
 };
 
 struct panwin_debug_reg_read {

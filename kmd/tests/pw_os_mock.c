@@ -1412,3 +1412,174 @@ void mock_destroy(struct pw_os *os)
 	free(os->pa_pages);
 	free(os);
 }
+
+/* ---- M3+ additions: user waits, user copies, deferred work ---- */
+
+int pw_os_event_wait_user(struct pw_os_event *e, uint64_t deadline_ns)
+{
+	struct timespec ts;
+	int ret = PW_OK;
+
+	ts.tv_sec = (time_t)(deadline_ns / 1000000000u);
+	ts.tv_nsec = (long)(deadline_ns % 1000000000u);
+	pthread_mutex_lock(&e->m);
+	while (!e->set) {
+		if (deadline_ns == UINT64_MAX) {
+			pthread_cond_wait(&e->c, &e->m);
+		} else if (pthread_cond_timedwait(&e->c, &e->m, &ts) == ETIMEDOUT) {
+			ret = e->set ? PW_OK : PW_ETIMEDOUT;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&e->m);
+	return ret;
+}
+
+/* The host tests run the "user" and the "kernel" in one address space: user pointers are host
+ * pointers. NULL with a non-zero size is the one fault we can model. */
+int pw_os_copy_from_user(struct pw_os *os, void *dst, uint64_t user_ptr, size_t size)
+{
+	(void)os;
+	if (!size)
+		return PW_OK;
+	if (!user_ptr)
+		return PW_EFAULT;
+	memcpy(dst, (const void *)(uintptr_t)user_ptr, size);
+	return PW_OK;
+}
+
+int pw_os_copy_to_user(struct pw_os *os, uint64_t user_ptr, const void *src, size_t size)
+{
+	(void)os;
+	if (!size)
+		return PW_OK;
+	if (!user_ptr)
+		return PW_EFAULT;
+	memcpy((void *)(uintptr_t)user_ptr, src, size);
+	return PW_OK;
+}
+
+/* One worker thread per work item: simple, and models "may run concurrently with other work". */
+struct pw_os_work {
+	struct pw_os *os;
+	pw_os_work_fn fn;
+	void *ctx;
+	pthread_t thr;
+	pthread_mutex_t m;
+	pthread_cond_t c;
+	bool pending, running, stop;
+	uint64_t not_before_ns;	/* for delayed queueing; 0 = now */
+};
+
+static void *work_thread(void *arg)
+{
+	struct pw_os_work *w = arg;
+
+	pthread_mutex_lock(&w->m);
+	for (;;) {
+		while (!w->stop && !w->pending)
+			pthread_cond_wait(&w->c, &w->m);
+		if (w->stop && !w->pending)
+			break;
+		if (w->not_before_ns) {
+			uint64_t now = pw_os_time_ns(w->os);
+
+			if (now < w->not_before_ns && !w->stop) {
+				struct timespec ts = {
+					.tv_sec = (time_t)(w->not_before_ns / 1000000000u),
+					.tv_nsec = (long)(w->not_before_ns % 1000000000u),
+				};
+				pthread_cond_timedwait(&w->c, &w->m, &ts);
+				continue;
+			}
+			if (w->stop) {	/* destroy cancels a pending delayed run */
+				w->pending = false;
+				break;
+			}
+		}
+		w->pending = false;
+		w->not_before_ns = 0;
+		w->running = true;
+		pthread_mutex_unlock(&w->m);
+		w->fn(w->ctx);
+		pthread_mutex_lock(&w->m);
+		w->running = false;
+		pthread_cond_broadcast(&w->c);
+	}
+	pthread_cond_broadcast(&w->c);
+	pthread_mutex_unlock(&w->m);
+	return NULL;
+}
+
+struct pw_os_work *pw_os_work_create(struct pw_os *os, pw_os_work_fn fn, void *ctx)
+{
+	struct pw_os_work *w = calloc(1, sizeof(*w));
+	pthread_condattr_t a;
+
+	if (!w)
+		return NULL;
+	w->os = os;
+	w->fn = fn;
+	w->ctx = ctx;
+	pthread_mutex_init(&w->m, NULL);
+	pthread_condattr_init(&a);
+	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+	pthread_cond_init(&w->c, &a);
+	pthread_condattr_destroy(&a);
+	if (pthread_create(&w->thr, NULL, work_thread, w)) {
+		pthread_cond_destroy(&w->c);
+		pthread_mutex_destroy(&w->m);
+		free(w);
+		return NULL;
+	}
+	__atomic_fetch_add(&os->syncs, 1, __ATOMIC_RELAXED);
+	return w;
+}
+
+void pw_os_work_queue(struct pw_os_work *w)
+{
+	pthread_mutex_lock(&w->m);
+	w->pending = true;
+	w->not_before_ns = 0;
+	pthread_cond_broadcast(&w->c);
+	pthread_mutex_unlock(&w->m);
+}
+
+void pw_os_work_queue_delayed(struct pw_os_work *w, uint32_t delay_ms)
+{
+	pthread_mutex_lock(&w->m);
+	if (!w->pending) {
+		w->pending = true;
+		w->not_before_ns = pw_os_time_ns(w->os) + (uint64_t)delay_ms * 1000000u;
+		pthread_cond_broadcast(&w->c);
+	}
+	pthread_mutex_unlock(&w->m);
+}
+
+void pw_os_work_flush(struct pw_os_work *w)
+{
+	pthread_mutex_lock(&w->m);
+	if (w->pending && w->not_before_ns)
+		w->not_before_ns = 1;	/* flush runs a pending delayed item now */
+	pthread_cond_broadcast(&w->c);
+	while (w->pending || w->running)
+		pthread_cond_wait(&w->c, &w->m);
+	pthread_mutex_unlock(&w->m);
+}
+
+void pw_os_work_destroy(struct pw_os *os, struct pw_os_work *w)
+{
+	if (!w)
+		return;
+	pthread_mutex_lock(&w->m);
+	if (w->pending && w->not_before_ns)
+		w->pending = false;	/* cancel a delayed run */
+	w->stop = true;
+	pthread_cond_broadcast(&w->c);
+	pthread_mutex_unlock(&w->m);
+	pthread_join(w->thr, NULL);
+	pthread_cond_destroy(&w->c);
+	pthread_mutex_destroy(&w->m);
+	free(w);
+	__atomic_fetch_sub(&os->syncs, 1, __ATOMIC_RELAXED);
+}

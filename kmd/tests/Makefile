@@ -17,8 +17,8 @@ CFLAGS  += -std=c11 -Wall -Wextra -Werror -fno-omit-frame-pointer \
            -I$(CORE) -I$(REPO)/include -I$(REPO)/include/drm-uapi -I. -pthread
 LDFLAGS += -fsanitize=address,undefined -pthread
 
-CORE_SRCS := $(addprefix $(CORE)/,pw_device.c pw_fw.c pw_gpu.c pw_irq.c pw_mmu.c pw_util.c)
-TEST_SRCS := test_main.c test_util.c test_fw_parse.c test_mmu.c test_device.c pw_os_mock.c
+CORE_SRCS := $(addprefix $(CORE)/,$(shell sed -n "s/^  '\(pw_[a-z_]*\.c\)',/\1/p" $(CORE)/meson.build))
+TEST_SRCS := test_main.c test_util.c test_fw_parse.c test_mmu.c test_device.c test_mem.c test_sync.c test_sched.c pw_os_mock.c
 OBJDIR    := obj
 OBJS      := $(addprefix $(OBJDIR)/core_,$(notdir $(CORE_SRCS:.c=.o))) \
              $(addprefix $(OBJDIR)/,$(TEST_SRCS:.c=.o))

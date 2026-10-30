@@ -87,7 +87,7 @@ void check_no_leaks(struct pw_os *os)
 }
 
 static const struct test_case *const suites[] = {
-	util_tests, fw_parse_tests, mmu_tests, device_tests,
+	util_tests, fw_parse_tests, mmu_tests, device_tests, mem_tests, sync_tests, sched_tests,
 };
 
 int main(int argc, char **argv)
