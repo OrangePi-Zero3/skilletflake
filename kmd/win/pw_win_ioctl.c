@@ -25,6 +25,11 @@
  * the file's abort event (ends its user waits), waits for the rundown, unmaps the file's user
  * mappings in the owning process, cancels its pending SYNCOBJ_EVENT notifies and only then
  * calls pw_file_close(), as pw_core.h requires.
+ *
+ * Both backends go through the same paths: the core's pw_file_ioctl() picks the panthor (CSF)
+ * or panfrost (JM) driver table, and pw_file_mmap_lookup() decides what an mmap offset means.
+ * A job-manager device has no user-MMIO page: the lookup fails with EINVAL and that errno is
+ * what PANWIN_IOCTL_MMAP completes with (panfrost has no such mmap offset either).
  * UNTESTED ON HARDWARE.
  */
 #include "pw_win.h"
@@ -108,6 +113,7 @@ static int pw_win_mmap(PW_FILE_CTX *fc, struct panwin_mmap *a)
 		return PW_ENOMEM;
 
 	RtlZeroMemory(&t, sizeof(t));
+	/* Errors are returned as they are, e.g. EINVAL for the user-MMIO offsets on JM. */
 	ret = pw_file_mmap_lookup(fc->pwf, a->offset, a->size, &t);
 	if (ret)
 		return ret;
@@ -534,10 +540,15 @@ static NTSTATUS pw_win_drm_ioctl(PW_FILE_CTX *fc, WDFREQUEST req, ULONG nr, size
 
 /* ---------------------------------------------------------------- private ioctls */
 
+/*
+ * GET_INFO. The DRM version is the device's own (pw_device_drm_version: panthor on CSF,
+ * panfrost on JM) whenever a probe has completed, even a failed one; without any device it
+ * is the CSF (panthor) version, as before job-manager support. PANWIN_INFO_JM says which.
+ */
 static NTSTATUS pw_win_get_info(PW_DEVICE_CTX *ctx, WDFREQUEST req, size_t *info)
 {
 	struct panwin_info *pi;
-	struct pw_device *pw = NULL;
+	struct pw_device *pw = NULL, *probed = NULL;
 	uint32_t maj, min, patch;
 	BOOLEAN held;
 	NTSTATUS st;
@@ -546,16 +557,21 @@ static NTSTATUS pw_win_get_info(PW_DEVICE_CTX *ctx, WDFREQUEST req, size_t *info
 	if (!NT_SUCCESS(st))
 		return st;
 	RtlZeroMemory(pi, sizeof(*pi));
-	pw_core_drm_version(&maj, &min, &patch);
 	pi->abi_version = PANWIN_ABI_VERSION;
-	pi->drm_version_major = maj;
-	pi->drm_version_minor = min;
 	pi->gpu_phys_base = (uint64_t)ctx->os.mmio_pa.QuadPart;
 	held = ExAcquireRundownProtection(&ctx->core_rundown);
-	if (held)
+	if (held) {
 		pw = pw_win_core(ctx);
+		/* ctx->pw outlives our rundown reference once probe has returned (pw_win.h). */
+		if (__atomic_load_n(&ctx->probed, __ATOMIC_ACQUIRE))
+			probed = ctx->pw;
+	}
+	pw_device_drm_version(probed, &maj, &min, &patch, NULL);
+	pi->drm_version_major = maj;
+	pi->drm_version_minor = min;
 	pi->flags = (PANWIN_DEBUG_IOCTLS ? PANWIN_INFO_DEBUG_BUILD : 0) |
-		    ((pw && pw_device_fw_booted(pw)) ? PANWIN_INFO_FW_BOOTED : 0);
+		    ((pw && pw_device_fw_booted(pw)) ? PANWIN_INFO_FW_BOOTED : 0) |
+		    (pw_device_backend(probed) == PW_BACKEND_JM ? PANWIN_INFO_JM : 0);
 	if (pw)
 		pw_device_describe(pw, pi->description, sizeof(pi->description));
 	else

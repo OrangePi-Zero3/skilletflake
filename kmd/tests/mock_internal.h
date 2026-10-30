@@ -65,9 +65,29 @@ void mock_reg_set_locked(struct pw_os *os, uint32_t off, uint32_t v);
 void mock_raise_mmu_fault_locked(struct pw_os *os, unsigned int as, uint32_t fault_status,
 				 uint64_t va);
 
+/* (jm-hw) more pw_os_mock.c helpers for mock_jm.c, all with the mock lock held */
+uint32_t mock_rawstat_locked(struct pw_os *os, unsigned int line);
+bool mock_as_enabled_locked(struct pw_os *os, unsigned int as);
+int  mock_gpu_translate_locked(struct pw_os *os, unsigned int as, uint64_t va, char access);
+uint64_t mock_gpu_timestamp_locked(struct pw_os *os);	/* GPU_TIMESTAMP, 24 MHz */
+uint64_t mock_gpu_cycles_locked(struct pw_os *os);	/* GPU_CYCLE_COUNT */
+/* Wake every thread waiting on the mock's condition (the executor included). */
+void mock_kick_locked(struct pw_os *os);
+/* Wait on the mock's condition for at most @timeout_ns (drops the lock meanwhile). */
+void mock_cond_wait_locked(struct pw_os *os, uint64_t timeout_ns);
+
 /* ---- (jm-arch) mock_jm.c, for pw_os_mock.c (G31 model only) ---- */
 struct mock_jm *mock_jm_create(void);
 void mock_jm_destroy(struct mock_jm *jm);
+/* (jm-hw) Executor thread: started by mock_create() once the mock lock exists, stopped by
+ * mock_destroy() before it goes away. Lock NOT held. */
+void mock_jm_start(struct pw_os *os);
+void mock_jm_stop(struct pw_os *os);
+/* (jm-hw) JOB_INT_CLEAR / MMU_INT_CLEAR written with @bits (after RAWSTAT was updated), and an
+ * AS command on @as (after the AS state was updated). */
+void mock_jm_int_clear_locked(struct pw_os *os, uint32_t bits);
+void mock_jm_mmu_clear_locked(struct pw_os *os, uint32_t bits);
+void mock_jm_as_command_locked(struct pw_os *os, unsigned int as, uint32_t cmd);
 /* GPU soft/hard reset: every slot idle, NEXT registers cleared. */
 void mock_jm_reset_locked(struct pw_os *os);
 /* A write to JOB_CONTROL (0x1010-0x1fff: JS_STATE, THROTTLE, JS_* slot registers; the

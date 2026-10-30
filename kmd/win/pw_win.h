@@ -12,6 +12,7 @@
 
 #include "pw_core.h"
 #include "pw_os.h"
+#include "pw_win_plat.h"
 
 #ifndef PANWIN_VERSION_STRING
 #define PANWIN_VERSION_STRING "unknown"
@@ -27,7 +28,8 @@
 #define PW_REG_BOOT_FIRMWARE L"BootFirmware"   /* DWORD, default 0 (M1: no FW boot) */
 #define PW_REG_FIRMWARE_ROOT L"FirmwareRoot"   /* REG_SZ, NT path ending in '\' */
 #define PW_REG_FIRMWARE_NAME L"FirmwareName"   /* REG_SZ, optional, relative to the root */
-#define PW_REG_PMU_CHECK     L"Rk3588PmuCheck" /* DWORD, default 1 */
+#define PW_REG_PMU_CHECK     L"Rk3588PmuCheck" /* DWORD, default 1; RK3588 (RKCP7410) only */
+#define PW_REG_PSC_CHECK     L"AcpiPscCheck"   /* DWORD, default 1; boards whose node has _PSC */
 #define PW_DEFAULT_FIRMWARE_ROOT L"\\SystemRoot\\System32\\drivers\\panwin\\"
 
 #define PW_PATH_MAX 260 /* WCHARs */
@@ -67,7 +69,7 @@ typedef struct _PW_DEVICE_CTX {
 	struct pw_device *volatile pw; /* published to the ISR right after pw_device_alloc() */
 	volatile LONG core_ready;      /* pw_device_probe() succeeded: ioctls may use ->pw */
 	int core_status;               /* last alloc/probe result, PW_OK if none yet */
-	BOOLEAN gpu_powered;           /* PMU check passed (or disabled): registers are safe */
+	BOOLEAN gpu_powered;           /* PMU/_PSC check passed (or disabled): registers are safe */
 	BOOLEAN core_failed_logged;
 	WDFINTERRUPT irq[PW_IRQ_COUNT];
 	ULONG irq_spurious[PW_IRQ_COUNT]; /* asserted lines masked by the glue (no core / declined) */
@@ -79,10 +81,21 @@ typedef struct _PW_DEVICE_CTX {
 	EX_RUNDOWN_REF core_rundown;
 	FAST_MUTEX files_lock;         /* KeEnterCriticalRegion + ExAcquireFastMutexUnsafe */
 	LIST_ENTRY files;
+	/*
+	 * (jm-glue) Board, from the ACPI hardware IDs (EvtDeviceAdd); NULL if not recognised, in
+	 * which case no SoC-specific check runs. `backend` is pw_device_backend() of the last probe,
+	 * published with `probed` (release) once pw_device_probe() returned, success or not; both
+	 * are cleared in D0Exit after the device is destroyed. GET_INFO may use ->pw while holding
+	 * core_rundown and seeing probed != 0 (D0Exit waits for the rundown before destroying it).
+	 */
+	const struct pw_win_platform *plat;
+	volatile LONG probed;
+	enum pw_backend backend;
 	/* parameters */
 	ULONG boot_firmware;
 	ULONG pmu_check;
-	uint32_t timer_hz;              /* CNTFRQ_EL0 */
+	ULONG psc_check;
+	uint32_t timer_hz;              /* CNTFRQ_EL0 (24 MHz on RK3588 and H616) */
 	WCHAR fw_name_w[PW_PATH_MAX];
 	char fw_name[PW_PATH_MAX];      /* ASCII copy of FirmwareName, "" = derive from GPU_ID */
 } PW_DEVICE_CTX;

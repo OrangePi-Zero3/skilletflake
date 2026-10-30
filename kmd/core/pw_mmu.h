@@ -81,6 +81,9 @@ struct pw_vm {
 		uint64_t start, size;
 	} locked;
 	uint32_t pt_pages;		/* statistics */
+	/* (added by jm-mem) Descriptor format, fixed at pw_vm_create(): dev->mmu.pt_format on
+	 * JM, always PW_PT_FORMAT_AARCH64_4K on CSF. */
+	enum pw_pt_format pt_format;
 };
 
 int  pw_vm_create(struct pw_device *dev, bool for_mcu, struct pw_vm **out);
@@ -136,5 +139,55 @@ int  pw_mmu_as_send_cmd(struct pw_device *dev, uint32_t as, uint32_t cmd);
  */
 int  pw_mmu_as_bind_locked(struct pw_vm *vm, uint32_t as);
 void pw_mmu_as_unbind_locked(struct pw_vm *vm);
+
+/* ---- additions (jm-mem) ---- */
+
+/*
+ * Legacy "Mali LPAE" descriptors (PW_PT_FORMAT_MALI_LPAE, pw_core.h). Same 4 KiB granule,
+ * index split, table descriptors (0b11 at levels 0-2) and output-address field as VMSAv8-64,
+ * but (format facts from Linux io-pgtable-arm.c ARM_MALI_LPAE and Arm's kbase
+ * mali_kbase_mmu_mode_lpae.c, read for the bit meanings only):
+ *  - leaf descriptors are 0b01 at every level, level-3 pages included (AArch64: 0b11);
+ *  - bits 6/7 grant GPU read/write (AArch64: AP[1] unprivileged / AP[2] read-only);
+ *  - no access flag; AttrIndx[4:2] and XN (bit 54) as in AArch64; shareability is always
+ *    outer (SH = 0b10): for Mali the inner domain is only the GPU's own cores and everything
+ *    beyond the GPU is outer, so cacheable mappings use outer too;
+ *  - the walk always starts at level 0, whatever the input address size (io-pgtable-arm.c
+ *    forces start level 0 for this format);
+ *  - AS_TRANSCFG is ADRMODE_LEGACY (0); AS_TRANSTAB holds the root PA with the address mode
+ *    (TABLE = 3) in bits [1:0], READ_INNER in bit 2, SHARE_OUTER (coherent walks) in bit 4;
+ *  - AS_MEMATTR: Mali has no real non-cacheable type here; Linux programs index 0 (our NC) and
+ *    index 2 (Device, never used on JM) as 0x88 "implementation-defined policy" and index 1 (WB)
+ *    as 0x8D "write-allocate", which we copy byte for byte so the register matches a Linux dump.
+ */
+#define PW_LPAE_PTE_TYPE_LEAF		1ull		/* block or page */
+#define PW_LPAE_PTE_RD			PW_BIT64(6)
+#define PW_LPAE_PTE_WR			PW_BIT64(7)
+#define PW_LPAE_TRANSTAB_ADRMODE_TABLE	3ull
+#define PW_LPAE_TRANSTAB_READ_INNER	PW_BIT64(2)
+#define PW_LPAE_TRANSTAB_SHARE_OUTER	PW_BIT64(4)
+#define PW_LPAE_MEMATTR_IMPL_DEF	0x88ull
+#define PW_LPAE_MEMATTR_WRITE_ALLOC	0x8dull
+#define PW_LPAE_MEMATTR			(PW_LPAE_MEMATTR_IMPL_DEF << (8 * PW_MAIR_IDX_NC) | \
+					 PW_LPAE_MEMATTR_WRITE_ALLOC << (8 * PW_MAIR_IDX_WB) | \
+					 PW_LPAE_MEMATTR_IMPL_DEF << (8 * PW_MAIR_IDX_DEV))
+
+/* Leaf attributes for PW_VM_MAP_* @flags in the Mali LPAE format (cf. pw_mmu_pte_attrs()). */
+uint64_t pw_mmu_lpae_pte_attrs(uint32_t flags, bool coherent);
+/* AS_TRANSTAB / AS_MEMATTR values of @vm for its format (pw_vm_transcfg() is format aware
+ * too). For AArch64 VMs these are the root PA and dev->mmu.memattr, as before. */
+uint64_t pw_vm_transtab(const struct pw_vm *vm);
+uint64_t pw_vm_memattr(const struct pw_vm *vm);
+
+/*
+ * TLB maintenance on JM (docs/status/jm-arch.md task B5). Every pw_vm_map_*() / pw_vm_unmap()
+ * of a VM bound to an AS locks the range (AS_COMMAND_LOCK), updates the descriptors, and then:
+ *  - CSF: cleans+invalidates the GPU caches (GPU_CMD) and sends AS_COMMAND_UNLOCK (panthor);
+ *  - JM: sends AS_COMMAND_FLUSH_PT after a map and AS_COMMAND_FLUSH_MEM after an unmap (or a
+ *    failed, rolled-back map) on the locked region, which flush the L2 / the MMU walk caches
+ *    and end the lock; no GPU_CMD flush and no UNLOCK (panfrost_mmu.c:
+ *    mmu_hw_do_operation_locked, Linux locks after the update instead of before).
+ * VMs without an AS get no AS commands on either backend.
+ */
 
 #endif /* PW_MMU_H */

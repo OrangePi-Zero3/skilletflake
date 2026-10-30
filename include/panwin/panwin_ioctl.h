@@ -3,7 +3,8 @@
  * panwin_ioctl.h - user/kernel ABI between libdrm-win.dll (and tools) and panwin.sys.
  *
  * Design: every Linux DRM ioctl the userspace issues (core DRM ioctls such as SYNCOBJ_*, GEM_CLOSE,
- * VERSION, and the panthor DRM_PANTHOR_* driver ioctls) is forwarded unchanged:
+ * VERSION, and the driver ioctls: DRM_PANTHOR_* on a CSF GPU such as the RK3588 Mali-G610,
+ * DRM_PANFROST_* on a job-manager GPU such as the H616 Mali-G31) is forwarded unchanged:
  *
  *   Linux:   ioctl(fd, DRM_IOCTL_X, &arg)          where DRM_IOCTL_X = _IOWR('d', nr, struct ...)
  *   Windows: DeviceIoControl(h, PANWIN_IOCTL_DRM(nr), &arg, sizeof arg, &arg, sizeof arg, ...)
@@ -21,9 +22,13 @@
  * Time: every absolute timeout in forwarded structs (drm_syncobj_wait.timeout_nsec, ...) is in
  * nanoseconds on the QueryPerformanceCounter clock (Mesa's os_time_get_nano() on Windows).
  *
- * mmap offsets: the user MMIO (LATEST_FLUSH_ID) page is accepted at both
+ * Which uAPI a device speaks is its DRM_IOCTL_VERSION name ("panthor" or "panfrost"), as on
+ * Linux; PANWIN_INFO_JM in GET_INFO says the same without an open DRM file.
+ *
+ * mmap offsets: on CSF (panthor) the user MMIO (LATEST_FLUSH_ID) page is accepted at both
  * DRM_PANTHOR_USER_MMIO_OFFSET_32BIT (1<<43, what Mesa computes on Windows: unsigned long is
- * 32-bit) and DRM_PANTHOR_USER_MMIO_OFFSET_64BIT (1<<56).
+ * 32-bit) and DRM_PANTHOR_USER_MMIO_OFFSET_64BIT (1<<56). On JM (panfrost) there is no user
+ * MMIO page: those offsets fail with EINVAL; BO offsets come from DRM_IOCTL_PANFROST_MMAP_BO.
  *
  * Private (Windows-only) ioctls replace POSIX facilities that don't exist on Windows:
  * mmap of BOs / the user MMIO page, poll-able syncobj events, driver info.
@@ -42,6 +47,9 @@
 
 /* ACPI hardware ID of the RK3588 Mali-G610 node added by our edk2-rk3588 patch. */
 #define PANWIN_ACPI_HID     "RKCP7410"
+/* ACPI hardware ID of the H616/H618 Mali-G31 node added by our Orange Pi Zero3 patch
+ * (firmware/zero3). */
+#define PANWIN_ACPI_HID_G31 "AWGP0031"
 
 #define PANWIN_FILE_DEVICE  0x8D52u   /* custom device type, 0x8000-0xFFFF range */
 #define PANWIN_ACCESS_RW    0x3u      /* FILE_READ_ACCESS | FILE_WRITE_ACCESS */
@@ -52,7 +60,8 @@
 	((PANWIN_FILE_DEVICE << 16) | (PANWIN_ACCESS_RW << 14) | ((uint32_t)(func) << 2) | PANWIN_METHOD_BUFFERED)
 
 /* Function code = 0x800 + DRM ioctl nr (_IOC_NR of the Linux ioctl number, 0x00..0xFF).
- * DRM core ioctls use nr 0x00-0x3F and 0xA0-0xCF, driver (panthor) ioctls 0x40 + DRM_PANTHOR_*. */
+ * DRM core ioctls use nr 0x00-0x3F and 0xA0-0xCF, driver ioctls 0x40 + DRM_PANTHOR_* (CSF) or
+ * 0x40 + DRM_PANFROST_* (JM): the same number means a different ioctl on the two backends. */
 #define PANWIN_FUNC_DRM_BASE   0x800u
 #define PANWIN_IOCTL_DRM(nr)   PANWIN_CTL_CODE(PANWIN_FUNC_DRM_BASE + ((nr) & 0xFFu))
 #define PANWIN_IOCTL_TO_DRM_NR(code) ((((code) >> 2) & 0xFFFu) - PANWIN_FUNC_DRM_BASE)
@@ -77,18 +86,24 @@
 struct panwin_info {
 	uint32_t abi_version;     /* out: PANWIN_ABI_VERSION */
 	uint32_t flags;           /* out: PANWIN_INFO_* */
-	uint32_t drm_version_major; /* out: emulated panthor DRM driver version, e.g. 1 */
-	uint32_t drm_version_minor; /* out: e.g. 5 (gates panvk features, see docs/research/mesa-panvk.md) */
+	uint32_t drm_version_major; /* out: emulated DRM driver version of this device (panthor on
+				     * CSF, panfrost if PANWIN_INFO_JM; panthor if no GPU was
+				     * probed), e.g. 1 */
+	uint32_t drm_version_minor; /* out: e.g. 5 (gates Mesa features, see docs/research/mesa-panvk.md) */
 	uint64_t gpu_phys_base;   /* out: MMIO base (diagnostics only) */
 	char     description[96]; /* out: pw_device_describe() */
 };
-#define PANWIN_INFO_FW_BOOTED   (1u << 0)
+#define PANWIN_INFO_FW_BOOTED   (1u << 0)   /* CSF only: the MCU firmware is running */
 #define PANWIN_INFO_DEBUG_BUILD (1u << 1)
+/* (ABI 2, additive) The probed GPU is a job-manager GPU (Bifrost: DRM driver "panfrost", no
+ * firmware, so FW_BOOTED is never set). Also set after a failed probe that got as far as
+ * reading GPU_ID. Older drivers never set it. */
+#define PANWIN_INFO_JM          (1u << 2)
 
 /*
  * Replacement for mmap(fd, offset) on a DRM fd. `offset` is the fake offset returned by
- * DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, or DRM_PANTHOR_USER_MMIO_OFFSET (+ page) for the user MMIO
- * (LATEST_FLUSH_ID) page. The kernel maps the pages into the calling process and returns the VA.
+ * DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET / DRM_IOCTL_PANFROST_MMAP_BO, or (CSF only)
+ * DRM_PANTHOR_USER_MMIO_OFFSET (+ page) for the user MMIO (LATEST_FLUSH_ID) page. The kernel maps the pages into the calling process and returns the VA.
  * Mappings are torn down by MUNMAP or when the file handle is closed.
  */
 struct panwin_mmap {

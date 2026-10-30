@@ -11,6 +11,16 @@
  *
  * AS management, lock regions, MMU fault decode: derived from Linux panthor_mmu.c (dual
  * GPL-2.0/MIT, used under MIT; Copyright 2019 Linaro Ltd, 2023 Collabora ltd.).
+ *
+ * (jm-mem) Job-manager additions, written here from format/behaviour facts only (Linux panfrost
+ * and io-pgtable-arm.c are GPL-2.0-only and no code was taken from them):
+ *  - a second descriptor format, the legacy "Mali LPAE" one (pw_mmu.h, PW_PT_FORMAT_MALI_LPAE),
+ *    selectable per device with pw_device_set_pt_format() and fixed per VM at creation. The
+ *    table walk/split/unmap code is shared: only the level-3 leaf type, the attribute bits, the
+ *    start level and the TRANSTAB/TRANSCFG/MEMATTR values differ (vm_leaf_type(),
+ *    vm_pte_attrs(), pw_vm_transtab(), pw_vm_transcfg(), pw_vm_memattr());
+ *  - panfrost's TLB maintenance on JM (vm_unlock_region(): FLUSH_PT / FLUSH_MEM instead of a
+ *    GPU cache flush + UNLOCK).
  */
 
 #include "pw_jm_mem.h"
@@ -26,6 +36,18 @@ static inline unsigned int level_shift(unsigned int lvl)
 static inline unsigned int level_index(uint64_t va, unsigned int lvl)
 {
 	return (unsigned int)(va >> level_shift(lvl)) & (PW_PT_ENTRIES - 1);
+}
+
+static inline bool vm_is_lpae(const struct pw_vm *vm)
+{
+	return vm->pt_format == PW_PT_FORMAT_MALI_LPAE;
+}
+
+/* (jm-mem) Type bits of a level-3 page descriptor: 0b11 in VMSAv8-64, 0b01 in Mali LPAE
+ * (blocks are 0b01 in both). */
+static inline uint64_t vm_page_type(const struct pw_vm *vm)
+{
+	return vm_is_lpae(vm) ? PW_LPAE_PTE_TYPE_LEAF : PW_PTE_TYPE_PAGE;
 }
 
 /* Lower attributes [11:2] and upper attributes [63:50] are at the same place in block and
@@ -60,6 +82,38 @@ uint64_t pw_mmu_pte_attrs(uint32_t flags, bool coherent)
 	else
 		pte |= PW_PTE_ATTRINDX(PW_MAIR_IDX_WB) | PW_PTE_SH_IS;
 	return pte;
+}
+
+/*
+ * (jm-mem) Mali LPAE leaf attributes for the same flags. The bit choice reproduces what Linux
+ * io-pgtable-arm.c stores for ARM_MALI_LPAE (format facts, no code): read permission always,
+ * write unless read-only, no AF / nG / AP bits, the same AttrIndx as the AArch64 tables above
+ * (WB for cached mappings, NC otherwise, Device for MMIO), always outer shareable (Mali's
+ * inner domain is the GPU cores only), XN for no-exec.
+ */
+uint64_t pw_mmu_lpae_pte_attrs(uint32_t flags, bool coherent)
+{
+	uint64_t pte = PW_LPAE_PTE_RD;
+
+	(void)coherent;
+	if (!(flags & PW_VM_MAP_READONLY))
+		pte |= PW_LPAE_PTE_WR;
+	if (flags & PW_VM_MAP_NOEXEC)
+		pte |= PW_PTE_XN;
+	if (flags & PW_VM_MAP_DEVICE)
+		pte |= PW_PTE_ATTRINDX(PW_MAIR_IDX_DEV);
+	else if (flags & PW_VM_MAP_UNCACHED)
+		pte |= PW_PTE_ATTRINDX(PW_MAIR_IDX_NC);
+	else
+		pte |= PW_PTE_ATTRINDX(PW_MAIR_IDX_WB);
+	return pte | PW_PTE_SH_OS;
+}
+
+static uint64_t vm_pte_attrs(const struct pw_vm *vm, uint32_t flags)
+{
+	if (vm_is_lpae(vm))
+		return pw_mmu_lpae_pte_attrs(flags, vm->dev->coherent);
+	return pw_mmu_pte_attrs(flags, vm->dev->coherent);
 }
 
 /* mmu.c:2178-2217 */
@@ -261,7 +315,7 @@ map_4k:
 			}
 			PW_WRITE_ONCE(pt->ptes[idx + k],
 				      ((pa + ((uint64_t)k << 12)) & PW_PTE_OA_MASK) | attrs |
-				      PW_PTE_TYPE_PAGE);
+				      vm_page_type(vm));
 			pt->nvalid++;
 			*mapped += PW_SZ_4K;
 		}
@@ -284,7 +338,7 @@ static int pt_split_block(struct pw_vm *vm, struct pw_pt *pt2, unsigned int idx)
 	if (!l3)
 		return PW_ENOMEM;
 	for (unsigned int i = 0; i < PW_PT_ENTRIES; i++)
-		l3->ptes[i] = (base + ((uint64_t)i << 12)) | attrs | PW_PTE_TYPE_PAGE;
+		l3->ptes[i] = (base + ((uint64_t)i << 12)) | attrs | vm_page_type(vm);
 	l3->nvalid = PW_PT_ENTRIES;
 	pt_flush(vm, l3, 0, PW_PT_ENTRIES);
 
@@ -383,7 +437,7 @@ int pw_vm_translate(struct pw_vm *vm, uint64_t va, uint64_t *pa, uint64_t *pte, 
 		if (lvl == 3 || type == PW_PTE_TYPE_BLOCK) {
 			uint64_t bs = 1ull << level_shift(lvl);
 
-			if ((lvl == 3 && type != PW_PTE_TYPE_PAGE) || lvl == 0)
+			if ((lvl == 3 && type != vm_page_type(vm)) || lvl == 0)
 				return PW_ENOENT;
 			if (pa)
 				*pa = (e & PW_PTE_OA_MASK & ~(bs - 1)) | (va & (bs - 1));
@@ -474,9 +528,33 @@ uint64_t pw_vm_root_pa(const struct pw_vm *vm)
 	return vm->root->pa;
 }
 
-/* mmu.c:788-793 */
+/* (jm-mem) pw_mmu.h. Mali LPAE: the address mode lives in TRANSTAB (io-pgtable-arm.c
+ * arm_mali_lpae_alloc_pgtable / kbase mmu_mode_lpae: TABLE | READ_INNER, SHARE_OUTER when the
+ * walk is coherent). */
+uint64_t pw_vm_transtab(const struct pw_vm *vm)
+{
+	uint64_t transtab = vm->root->pa;
+
+	if (vm_is_lpae(vm)) {
+		transtab |= PW_LPAE_TRANSTAB_ADRMODE_TABLE | PW_LPAE_TRANSTAB_READ_INNER;
+		if (vm->dev->coherent)
+			transtab |= PW_LPAE_TRANSTAB_SHARE_OUTER;
+	}
+	return transtab;
+}
+
+uint64_t pw_vm_memattr(const struct pw_vm *vm)
+{
+	return vm_is_lpae(vm) ? PW_LPAE_MEMATTR : vm->dev->mmu.memattr;
+}
+
+/* mmu.c:788-793; (jm-mem) Mali LPAE: ADRMODE_LEGACY, the rest of TRANSCFG unused
+ * (panfrost_mmu.c:mmu_cfg_init_mali_lpae). */
 uint64_t pw_vm_transcfg(const struct pw_vm *vm)
 {
+	if (vm_is_lpae(vm))
+		return AS_TRANSCFG_ADRMODE_LEGACY;
+
 	uint64_t transcfg = AS_TRANSCFG_PTW_MEMATTR_WB | AS_TRANSCFG_PTW_RA |
 			    AS_TRANSCFG_ADRMODE_AARCH64_4K |
 			    AS_TRANSCFG_INA_BITS(55 - vm->dev->mmu.va_bits);
@@ -548,14 +626,15 @@ enable:
 		gpu_write(dev, MMU_INT_BASE + INT_CLEAR, MMU_INT_AS_FAULT(as));
 		mmu->faulty_mask &= ~PW_BIT(as);
 	}
-	ret = as_enable(dev, (uint32_t)as, vm->root->pa, pw_vm_transcfg(vm), mmu->memattr);
+	ret = as_enable(dev, (uint32_t)as, pw_vm_transtab(vm), pw_vm_transcfg(vm),
+			pw_vm_memattr(vm));
 	if (ret) {
 		pw_err(dev, "AS%d: enable failed (%d)", as, ret);
 		vm_release_as_locked(vm);
 	} else {
 		pw_dbg(dev, "AS%d: TRANSTAB 0x%llx TRANSCFG 0x%llx MEMATTR 0x%016llx", as,
-		       (unsigned long long)vm->root->pa, (unsigned long long)pw_vm_transcfg(vm),
-		       (unsigned long long)mmu->memattr);
+		       (unsigned long long)pw_vm_transtab(vm), (unsigned long long)pw_vm_transcfg(vm),
+		       (unsigned long long)pw_vm_memattr(vm));
 	}
 out:
 	pw_os_mutex_unlock(mmu->slots_lock);
@@ -615,7 +694,7 @@ int pw_mmu_as_bind_locked(struct pw_vm *vm, uint32_t as)
 		gpu_write(dev, MMU_INT_BASE + INT_CLEAR, MMU_INT_AS_FAULT(as));
 		mmu->faulty_mask &= ~PW_BIT(as);
 	}
-	ret = as_enable(dev, as, vm->root->pa, pw_vm_transcfg(vm), mmu->memattr);
+	ret = as_enable(dev, as, pw_vm_transtab(vm), pw_vm_transcfg(vm), pw_vm_memattr(vm));
 	if (ret) {
 		pw_err(dev, "AS%u: enable failed (%d)", as, ret);
 		vm_release_as_locked(vm);
@@ -658,14 +737,28 @@ static int vm_lock_region(struct pw_vm *vm, uint64_t start, uint64_t size)
 	return ret;
 }
 
-/* mmu.c:1827-1856. op_lock held. */
-static int vm_unlock_region(struct pw_vm *vm)
+/*
+ * mmu.c:1827-1856. op_lock held. @unmapped: descriptors were removed (unmap, or the rollback
+ * of a failed map), not only added.
+ * (jm-mem) JM: end the lock with FLUSH_PT (map) or FLUSH_MEM (unmap) on the locked region
+ * instead of a GPU_CMD cache flush + UNLOCK (panfrost_mmu.c:mmu_hw_do_operation_locked; the
+ * flush commands write back / invalidate the L2 and the MMU's cached walks for the region and
+ * complete the lock). FLUSH_MEM after an unmap also drains GPU writes that could still target
+ * the pages about to be freed (Arm kbase uses it there too). Untested on hardware.
+ */
+static int vm_unlock_region(struct pw_vm *vm, bool unmapped)
 {
 	struct pw_device *dev = vm->dev;
 	int ret = PW_OK;
 
 	pw_os_mutex_lock(dev->mmu.slots_lock);
-	if (vm->as >= 0 && vm->locked.size) {
+	if (vm->as >= 0 && vm->locked.size && dev->backend == PW_BACKEND_JM) {
+		ret = pw_mmu_as_send_cmd(dev, (uint32_t)vm->as,
+					 unmapped ? AS_COMMAND_FLUSH_MEM : AS_COMMAND_FLUSH_PT);
+		if (ret)
+			pw_err(dev, "AS%d: %s failed (%d), GPU needs a reset", vm->as,
+			       unmapped ? "FLUSH_MEM" : "FLUSH_PT", ret);
+	} else if (vm->as >= 0 && vm->locked.size) {
 		ret = pw_gpu_flush_caches(dev, CACHE_CLEAN | CACHE_INV, CACHE_CLEAN | CACHE_INV,
 					  CACHE_INV);
 		if (!ret)
@@ -707,6 +800,13 @@ int pw_vm_create(struct pw_device *dev, bool for_mcu, struct pw_vm **out)
 	/* Number of levels needed to resolve va_bits with 9 bits per level above the 12-bit page
 	 * offset; the root table may be partially used (e.g. 40 bits -> 2 entries at level 0). */
 	vm->start_level = 4 - PW_DIV_ROUND_UP(va_bits - 12, 9);
+	/* (jm-mem) Mali LPAE (JM only, never the MCU VM): always a full 4-level walk. */
+	vm->pt_format = PW_PT_FORMAT_AARCH64_4K;
+	if (dev->backend == PW_BACKEND_JM && !for_mcu &&
+	    dev->mmu.pt_format == PW_PT_FORMAT_MALI_LPAE) {
+		vm->pt_format = PW_PT_FORMAT_MALI_LPAE;
+		vm->start_level = 0;
+	}
 	vm->op_lock = pw_os_mutex_create(dev->os);
 	if (!vm->op_lock)
 		goto err;
@@ -767,7 +867,7 @@ typedef int (*next_run_fn)(void *ctx, struct map_run *run);
 static int vm_map_runs(struct pw_vm *vm, uint64_t va, uint64_t size, uint32_t flags,
 		       next_run_fn next, void *ctx)
 {
-	uint64_t attrs = pw_mmu_pte_attrs(flags, vm->dev->coherent);
+	uint64_t attrs = vm_pte_attrs(vm, flags);
 	uint64_t mapped = 0;
 	struct map_run run;
 	int ret, ret2;
@@ -792,7 +892,7 @@ static int vm_map_runs(struct pw_vm *vm, uint64_t va, uint64_t size, uint32_t fl
 	if (ret && mapped)
 		vm_unmap_locked(vm, va, mapped);
 
-	ret2 = vm_unlock_region(vm);
+	ret2 = vm_unlock_region(vm, ret && mapped);
 	if (!ret)
 		ret = ret2;
 out:
@@ -884,7 +984,7 @@ int pw_vm_unmap(struct pw_vm *vm, uint64_t va, uint64_t size)
 	ret = vm_lock_region(vm, va, size);
 	if (!ret) {
 		ret = vm_unmap_locked(vm, va, size);
-		ret2 = vm_unlock_region(vm);
+		ret2 = vm_unlock_region(vm, true);
 		if (!ret)
 			ret = ret2;
 	}
@@ -993,6 +1093,17 @@ void pw_mmu_fini(struct pw_device *dev)
 	mmu->alloc_mask = 0;
 	pw_os_mutex_unlock(mmu->slots_lock);
 	pw_irq_suspend(dev, PW_IRQ_MMU);
+}
+
+/* (jm-mem) pw_core.h */
+int pw_device_set_pt_format(struct pw_device *dev, enum pw_pt_format fmt)
+{
+	if (!dev || (fmt != PW_PT_FORMAT_AARCH64_4K && fmt != PW_PT_FORMAT_MALI_LPAE))
+		return PW_EINVAL;
+	if (fmt == PW_PT_FORMAT_MALI_LPAE && dev->backend == PW_BACKEND_CSF)
+		return PW_EOPNOTSUPP;
+	dev->mmu.pt_format = fmt;
+	return PW_OK;
 }
 
 void pw_mmu_release(struct pw_device *dev)

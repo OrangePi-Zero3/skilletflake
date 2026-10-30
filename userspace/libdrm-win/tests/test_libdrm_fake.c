@@ -91,6 +91,67 @@ static void test_devices(void)
 	CHECK(panwin_open("C:\\foo", 0) == -1 && errno == ENOENT);
 }
 
+/* (jm-glue) Platform info and drmOpenWithType() follow the device's own driver name. */
+static void check_platform(drmDevicePtr d, const char *fullname, const char *compat0,
+			   const char *compat1)
+{
+	CHECK(d && d->bustype == DRM_BUS_PLATFORM);
+	if (!d)
+		return;
+	CHECK(!strcmp(d->businfo.platform->fullname, fullname));
+	CHECK(!strcmp(d->deviceinfo.platform->compatible[0], compat0));
+	CHECK(!strcmp(d->deviceinfo.platform->compatible[1], compat1));
+	CHECK(d->deviceinfo.platform->compatible[2] == NULL);
+}
+
+static void test_driver_names(void)
+{
+	static const char *const modes[] = { "panfrost", "panfrost-nocore" };
+	drmDevicePtr devs[2], d = NULL;
+	drmVersionPtr v;
+	int n, fd;
+
+	for (size_t m = 0; m < 2; m++) {
+		SetEnvironmentVariableA("PANWIN_FAKE_DRM_NAME", modes[m]);
+		n = drmGetDevices2(0, devs, 2);
+		CHECK(n == 1);
+		if (n == 1)
+			check_platform(devs[0], "/gpu@1800000", "allwinner,sun50i-h616-mali",
+				       "arm,mali-bifrost");
+		drmFreeDevices(devs, n > 0 ? n : 0);
+		CHECK(drmGetDeviceFromDevId((dev_t)((226u << 8) | 128u), 0, &d) == 0);
+		check_platform(d, "/gpu@1800000", "allwinner,sun50i-h616-mali", "arm,mali-bifrost");
+		drmFreeDevice(&d);
+		errno = 0;
+		CHECK(drmOpenWithType("panthor", NULL, DRM_NODE_RENDER) == -1 && errno == ENODEV);
+		fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
+		CHECK(fd >= 0);
+		if (fd >= 0) {
+			CHECK(drmGetDevice2(fd, 0, &d) == 0);
+			check_platform(d, "/gpu@1800000", "allwinner,sun50i-h616-mali",
+				       "arm,mali-bifrost");
+			drmFreeDevice(&d);
+			v = drmGetVersion(fd);
+			if (m == 0)
+				CHECK(v && !strcmp(v->name, "panfrost"));
+			else
+				CHECK(!v && errno == ENODEV);
+			drmFreeVersion(v);
+			CHECK(drmClose(fd) == 0);
+		}
+	}
+	SetEnvironmentVariableA("PANWIN_FAKE_DRM_NAME", NULL);
+	CHECK(drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER) == -1 && errno == ENODEV);
+	fd = drmOpenWithType(NULL, NULL, DRM_NODE_RENDER);
+	CHECK(fd >= 0);
+	if (fd >= 0) {
+		CHECK(drmGetDevice2(fd, 0, &d) == 0);
+		check_platform(d, "/gpu@fb000000", "rockchip,rk3588-mali", "arm,mali-valhall-csf");
+		drmFreeDevice(&d);
+		CHECK(drmClose(fd) == 0);
+	}
+}
+
 static void test_fds(int fd)
 {
 	CHECK(fd >= PANWIN_FD_BASE);
@@ -496,6 +557,7 @@ int main(void)
 
 	test_errno_map();
 	test_devices();
+	test_driver_names();
 
 	int fd = drmOpenWithType("panthor", NULL, DRM_NODE_RENDER);
 	CHECK(fd >= 0);

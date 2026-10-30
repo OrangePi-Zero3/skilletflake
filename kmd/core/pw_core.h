@@ -175,4 +175,31 @@ enum pw_backend pw_device_backend(const struct pw_device *dev);
 void pw_device_drm_version(const struct pw_device *dev, uint32_t *major, uint32_t *minor,
 			   uint32_t *patch, const char **name);
 
+/* ---- additions (jm-mem): GPU page-table format, job-manager GPUs only ---- */
+
+/*
+ * Descriptor format of the GPU page tables the core writes (pw_mmu.c):
+ *   AARCH64_4K - VMSAv8-64 stage-1 tables, AS_TRANSCFG ADRMODE_AARCH64_4K. The default, and
+ *                the only format on CSF.
+ *   MALI_LPAE  - the pre-AArch64 "Mali LPAE" format Linux panfrost uses on GPUs without
+ *                GPU_QUIRK_FORCE_AARCH64_PGTABLE (the H616 G31 among them): TRANSCFG
+ *                ADRMODE_LEGACY, mode and table base in AS_TRANSTAB, 4 levels always,
+ *                read/write permission bits instead of AP, no access flag. JM only.
+ * Which of the two the H616 G31 needs is not known yet (docs/status/jm-arch.md, open question
+ * 2); both are untested on hardware.
+ */
+enum pw_pt_format {
+	PW_PT_FORMAT_AARCH64_4K = 0,
+	PW_PT_FORMAT_MALI_LPAE = 1,
+};
+
+/*
+ * Select the page-table format for address spaces created afterwards (VMs created earlier
+ * keep theirs). Call it between pw_device_alloc() and pw_device_probe() (e.g. from a registry
+ * value) or, on JM, later (pw_jm_hw_init() from a quirk, tests). The request only applies to
+ * JM devices: CSF VMs are always AArch64 (the MCU needs it). Returns PW_OK, PW_EINVAL (unknown
+ * @fmt or NULL @dev), PW_EOPNOTSUPP (MALI_LPAE on a device already probed as CSF).
+ */
+int pw_device_set_pt_format(struct pw_device *dev, enum pw_pt_format fmt);
+
 #endif /* PW_CORE_H */

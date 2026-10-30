@@ -4,9 +4,14 @@
  * hardware resources (1 MMIO window + 3 interrupts in ACPI _CRS order job/mmu/gpu), power
  * transitions and interrupt plumbing into the OS-neutral core.
  *
+ * Two boards (pw_win_plat.c, from the ACPI hardware IDs read in EvtDeviceAdd): the RK3588
+ * Mali-G610 (CSF, _HID RKCP7410) and the Allwinner H616/H618 Mali-G31 (job manager, _HID
+ * AWGP0031, Orange Pi Zero3). Every SoC-specific step below runs only on its own board.
+ *
  * Lifetime of the core device (struct pw_device):
  *   EvtDevicePrepareHardware          map MMIO, check resources
- *   EvtDeviceD0Entry                  RK3588 PMU check, mask the 3 interrupt sources
+ *   EvtDeviceD0Entry                  power check (RK3588: PMU2 registers; H616: ACPI _PSC),
+ *                                     mask the 3 interrupt sources
  *   (KMDF connects the interrupts)
  *   EvtDeviceD0EntryPostInterruptsEnabled  pw_device_alloc(), publish to the ISR, then
  *                                     pw_device_probe() - IRQs are live, so the core can wait
@@ -24,6 +29,10 @@
 #include "pw_win.h"
 #include "pw_fmt.h"
 #include "panwin/panwin_ioctl.h"
+
+#include <acpiioct.h>
+
+_Static_assert(sizeof(WCHAR) == sizeof(uint16_t), "hardware IDs are UTF-16");
 
 DRIVER_INITIALIZE DriverEntry;
 static EVT_WDF_DRIVER_DEVICE_ADD pw_win_device_add;
@@ -60,7 +69,9 @@ static const char *const pw_irq_name[PW_IRQ_COUNT] = { "job", "mmu", "gpu" };
  * first GPU register access we apply the same test as the edk2 patch's GPON method
  * (firmware/edk2-rk3588, \_SB.GPU0): BISR_STATUS4 bit 1 set (domain on and memory repair done),
  * BUS_IDLE_ST0 bit 0 and BUS_IDLE_ACK0 bit 0 clear (NIU out of idle). PWR_GATE_ST0 is logged too.
- * The PMU is not one of our resources; it is mapped for these reads only.
+ * The PMU is not one of our resources; it is mapped for these reads only, and only when the
+ * device's hardware ID says RK3588 (pw_win_platform.rk3588_pmu): on the H616 that physical
+ * address is DRAM or unmapped.
  */
 #define RK3588_PMU2_BASE          0xFD8D8000ULL
 #define RK3588_PMU_BUS_IDLE_ACK0  0x118
@@ -87,8 +98,9 @@ static PVOID pw_win_map_io(PHYSICAL_ADDRESS pa, SIZE_T len)
 	return MmMapIoSpace(pa, len, MmNonCached);
 }
 
-/* Architected timer frequency (CNTFRQ_EL0, readable at EL1; firmware programs it, 24 MHz on
- * RK3588). Passed to the core for FW timeouts; 0 lets the core use its default. */
+/* Architected timer frequency (CNTFRQ_EL0, readable at EL1; firmware programs it: 24 MHz on
+ * RK3588 and on the H616, whose arch timer runs from the 24 MHz OSC). Passed to the core as
+ * pw_device_params.timer_hz (FW timeouts on CSF); 0 lets the core use its default. */
 static uint32_t pw_win_read_cntfrq(void)
 {
 	uint64_t f;
@@ -138,6 +150,38 @@ static USHORT pw_reg_string(WDFKEY *keys, int nkeys, const WCHAR *name, WCHAR *b
 	return 0;
 }
 
+/* Board from DevicePropertyHardwareID (REG_MULTI_SZ), pw_win_plat.c. NULL if unknown. */
+static const struct pw_win_platform *pw_win_query_platform(WDFDEVICE device)
+{
+	WCHAR ids[256];
+	char first[64];
+	const struct pw_win_platform *p;
+	ULONG bytes = 0;
+	NTSTATUS st;
+	ULONG i;
+
+	RtlZeroMemory(ids, sizeof(ids));
+	/* Two WCHARs short so the list stays double-NUL terminated whatever is returned. */
+	st = WdfDeviceQueryProperty(device, DevicePropertyHardwareID,
+				    sizeof(ids) - 2 * sizeof(WCHAR), ids, &bytes);
+	if (!NT_SUCCESS(st)) {
+		PW_WLOG(PW_LOG_ERR, "cannot read the hardware IDs (0x%08x): board unknown",
+			(unsigned)st);
+		return NULL;
+	}
+	for (i = 0; i + 1 < sizeof(first) && ids[i]; i++)
+		first[i] = ids[i] < 0x80 ? (char)ids[i] : '?';
+	first[i] = 0;
+	p = pw_win_platform_from_hwids((const uint16_t *)ids, bytes / sizeof(WCHAR));
+	if (p)
+		PW_WLOG(PW_LOG_INFO, "board: %s %s (%s, _HID %s, hardware ID %s)", p->soc, p->gpu,
+			p->csf ? "CSF" : "job manager", p->hid, first);
+	else
+		PW_WLOG(PW_LOG_ERR, "board not recognised from hardware ID %s: no SoC power check "
+			"can run, so GPU registers will not be touched", first);
+	return p;
+}
+
 static void pw_win_read_params(PW_DEVICE_CTX *ctx)
 {
 	WDFKEY keys[2] = { NULL, NULL };
@@ -154,6 +198,7 @@ static void pw_win_read_params(PW_DEVICE_CTX *ctx)
 
 	ctx->boot_firmware = pw_reg_ulong(keys, 2, PW_REG_BOOT_FIRMWARE, 0);
 	ctx->pmu_check = pw_reg_ulong(keys, 2, PW_REG_PMU_CHECK, 1);
+	ctx->psc_check = pw_reg_ulong(keys, 2, PW_REG_PSC_CHECK, 1);
 	n = pw_reg_string(keys, 2, PW_REG_FIRMWARE_ROOT, root, PW_PATH_MAX);
 	if (n)
 		pw_os_win_set_firmware_root(&ctx->os, root, n);
@@ -165,9 +210,14 @@ static void pw_win_read_params(PW_DEVICE_CTX *ctx)
 		if (keys[i])
 			WdfRegistryClose(keys[i]);
 
-	PW_WLOG(PW_LOG_INFO, "params: BootFirmware=%lu Rk3588PmuCheck=%lu FirmwareName=%s",
-		(unsigned long)ctx->boot_firmware, (unsigned long)ctx->pmu_check,
-		ctx->fw_name[0] ? ctx->fw_name : "(from GPU_ID)");
+	PW_WLOG(PW_LOG_INFO, "params: BootFirmware=%lu Rk3588PmuCheck=%lu AcpiPscCheck=%lu "
+		"FirmwareName=%s", (unsigned long)ctx->boot_firmware, (unsigned long)ctx->pmu_check,
+		(unsigned long)ctx->psc_check, ctx->fw_name[0] ? ctx->fw_name : "(from GPU_ID)");
+	/* Only the checks of this board apply (pw_win_d0_entry). */
+	if (ctx->plat && !ctx->plat->rk3588_pmu && ctx->pmu_check)
+		PW_WLOG(PW_LOG_DBG, "Rk3588PmuCheck ignored: not an RK3588");
+	if (ctx->plat && !ctx->plat->acpi_psc && !ctx->psc_check)
+		PW_WLOG(PW_LOG_DBG, "AcpiPscCheck ignored: %s has no _PSC check", ctx->plat->soc);
 }
 
 /* ------------------------------------------------------------------------ interrupts */
@@ -241,7 +291,6 @@ static NTSTATUS pw_win_prepare_hardware(WDFDEVICE device, WDFCMRESLIST raw, WDFC
 	PHYSICAL_ADDRESS pa = { 0 };
 	ULONGLONG len = 0;
 
-	(void)raw;
 	for (ULONG i = 0; i < count; i++) {
 		PCM_PARTIAL_RESOURCE_DESCRIPTOR d = WdfCmResourceListGetDescriptor(translated, i);
 
@@ -265,14 +314,27 @@ static NTSTATUS pw_win_prepare_hardware(WDFDEVICE device, WDFCMRESLIST raw, WDFC
 					len = (ULONGLONG)d->u.Memory64.Length64 << 32;
 			}
 			break;
-		case CmResourceTypeInterrupt:
-			PW_WLOG(PW_LOG_INFO, "irq %lu (%s): vector %lu level %lu %s",
-				(unsigned long)nirq, nirq < PW_IRQ_COUNT ? pw_irq_name[nirq] : "extra",
+		case CmResourceTypeInterrupt: {
+			/* The raw descriptor carries the ACPI GSIV (logged for comparison with the
+			 * firmware node: UNVERIFIED that Vector holds the GSIV on ARM64). */
+			PCM_PARTIAL_RESOURCE_DESCRIPTOR r = i < WdfCmResourceListGetCount(raw) ?
+				WdfCmResourceListGetDescriptor(raw, i) : NULL;
+			ULONG gsiv = (r && r->Type == CmResourceTypeInterrupt) ? r->u.Interrupt.Vector :
+									    0;
+
+			ULONG want = (ctx->plat && nirq < PW_IRQ_COUNT) ? ctx->plat->gsiv[nirq] : 0;
+
+			PW_WLOG(PW_LOG_INFO, "irq %lu (%s): raw vector %lu (firmware node: GSIV %lu%s), "
+				"vector %lu level %lu %s", (unsigned long)nirq,
+				nirq < PW_IRQ_COUNT ? pw_irq_name[nirq] : "extra", (unsigned long)gsiv,
+				(unsigned long)want, !want ? ", board unknown" :
+				gsiv == want ? "" : ", DIFFERENT",
 				(unsigned long)d->u.Interrupt.Vector,
 				(unsigned long)d->u.Interrupt.Level,
 				(d->Flags & CM_RESOURCE_INTERRUPT_LATCHED) ? "edge" : "level");
 			nirq++;
 			break;
+		}
 		default:
 			break;
 		}
@@ -287,9 +349,14 @@ static NTSTATUS pw_win_prepare_hardware(WDFDEVICE device, WDFCMRESLIST raw, WDFC
 		PW_WLOG(PW_LOG_ERR, "unexpected MMIO window size 0x%llx", (unsigned long long)len);
 		return STATUS_DEVICE_CONFIGURATION_ERROR;
 	}
-	if (len != 0x200000)
-		PW_WLOG(PW_LOG_WARN, "MMIO window is 0x%llx bytes, RK3588 has 0x200000",
-			(unsigned long long)len);
+	/* Per board: RK3588 0xFB000000 + 0x200000, H616 0x01800000 + 0x40000 (pw_win_plat.c). */
+	if (!ctx->plat)
+		PW_WLOG(PW_LOG_WARN, "MMIO window 0x%llx+0x%llx (board not recognised)",
+			(unsigned long long)pa.QuadPart, (unsigned long long)len);
+	else if (len != ctx->plat->mmio_size || pa.QuadPart != (LONGLONG)ctx->plat->mmio_base)
+		PW_WLOG(PW_LOG_WARN, "MMIO window is 0x%llx+0x%llx, the %s GPU is 0x%lx+0x%lx",
+			(unsigned long long)pa.QuadPart, (unsigned long long)len, ctx->plat->soc,
+			(unsigned long)ctx->plat->mmio_base, (unsigned long)ctx->plat->mmio_size);
 
 	ctx->os.mmio = pw_win_map_io(pa, (SIZE_T)len);
 	if (!ctx->os.mmio) {
@@ -348,15 +415,82 @@ static BOOLEAN pw_win_rk3588_gpu_powered(void)
 	return on;
 }
 
+/*
+ * H616 (firmware/zero3 GPU0 node): evaluate _PSC through ACPI.sys (IOCTL_ACPI_EVAL_METHOD on the
+ * PDO, our default I/O target). The node returns 0 only when the PRCM PPU GPU domain is on, the
+ * bus clock gate is open and the reset is released, i.e. when a GPU register access cannot hang
+ * the bus. ACPI has already run _PS0 when D0Entry is called. UNTESTED ON HARDWARE.
+ */
+static BOOLEAN pw_win_acpi_psc_on(PW_DEVICE_CTX *ctx)
+{
+	ACPI_EVAL_INPUT_BUFFER in;
+	union {
+		ACPI_EVAL_OUTPUT_BUFFER out;
+		UCHAR raw[sizeof(ACPI_EVAL_OUTPUT_BUFFER) + 16];
+	} o;
+	WDF_MEMORY_DESCRIPTOR din, dout;
+	WDF_REQUEST_SEND_OPTIONS opt;
+	ULONG_PTR got = 0;
+	NTSTATUS st;
+	ULONG psc;
+
+	RtlZeroMemory(&in, sizeof(in));
+	RtlZeroMemory(&o, sizeof(o));
+	in.Signature = ACPI_EVAL_INPUT_BUFFER_SIGNATURE;
+	in.MethodName[0] = '_';
+	in.MethodName[1] = 'P';
+	in.MethodName[2] = 'S';
+	in.MethodName[3] = 'C';
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&din, &in, sizeof(in));
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&dout, &o, sizeof(o));
+	WDF_REQUEST_SEND_OPTIONS_INIT(&opt, 0);
+	WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opt, WDF_REL_TIMEOUT_IN_SEC(2));
+	st = WdfIoTargetSendIoctlSynchronously(WdfDeviceGetIoTarget(ctx->device), NULL,
+					       IOCTL_ACPI_EVAL_METHOD, &din, &dout, &opt, &got);
+	if (!NT_SUCCESS(st)) {
+		PW_WLOG(PW_LOG_ERR, "ACPI _PSC: evaluation failed: 0x%08x", (unsigned)st);
+		return FALSE;
+	}
+	if (got < sizeof(ACPI_EVAL_OUTPUT_BUFFER) ||
+	    o.out.Signature != ACPI_EVAL_OUTPUT_BUFFER_SIGNATURE || o.out.Count < 1 ||
+	    o.out.Argument[0].Type != ACPI_METHOD_ARGUMENT_INTEGER) {
+		PW_WLOG(PW_LOG_ERR, "ACPI _PSC: unexpected result (%lu bytes, signature 0x%08lx, "
+			"count %lu, type %u)", (unsigned long)got, (unsigned long)o.out.Signature,
+			(unsigned long)o.out.Count, (unsigned)o.out.Argument[0].Type);
+		return FALSE;
+	}
+	psc = o.out.Argument[0].Argument;
+	PW_WLOG(psc ? PW_LOG_ERR : PW_LOG_INFO, "ACPI _PSC = %lu -> GPU %s", (unsigned long)psc,
+		psc ? "NOT accessible (domain, bus gate or reset still off)" : "on (D0)");
+	return psc == 0;
+}
+
 static NTSTATUS pw_win_d0_entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
 {
 	PW_DEVICE_CTX *ctx = PwDeviceCtx(device);
+	const struct pw_win_platform *plat = ctx->plat;
 
 	(void)previous;
-	ctx->gpu_powered = ctx->pmu_check ? pw_win_rk3588_gpu_powered() : TRUE;
+	/* Each board's own check, never another board's (pw_win_plat.h). */
+	if (!plat)
+		ctx->gpu_powered = FALSE;
+	else if (plat->rk3588_pmu)
+		ctx->gpu_powered = ctx->pmu_check ? pw_win_rk3588_gpu_powered() : TRUE;
+	else if (plat->acpi_psc)
+		ctx->gpu_powered = ctx->psc_check ? pw_win_acpi_psc_on(ctx) : TRUE;
+	else
+		ctx->gpu_powered = TRUE;
 	if (!ctx->gpu_powered) {
-		PW_WLOG(PW_LOG_ERR, "GPU power domain is off: not touching GPU registers. Fix the "
-			"firmware (edk2 GPU power-up) or set Rk3588PmuCheck=0 at your own risk");
+		if (!plat)
+			PW_WLOG(PW_LOG_ERR, "board not recognised: not touching GPU registers");
+		else if (plat->rk3588_pmu)
+			PW_WLOG(PW_LOG_ERR, "GPU power domain is off: not touching GPU registers. "
+				"Fix the firmware (edk2 GPU power-up) or set Rk3588PmuCheck=0 at "
+				"your own risk");
+		else
+			PW_WLOG(PW_LOG_ERR, "GPU not powered according to ACPI: not touching GPU "
+				"registers. Fix the firmware (GPU0 _PS0/_PSC) or set AcpiPscCheck=0 "
+				"at your own risk");
 		return STATUS_SUCCESS;
 	}
 	__atomic_store_n(&ctx->os.regs_enabled, 1, __ATOMIC_SEQ_CST);
@@ -376,6 +510,8 @@ static NTSTATUS pw_win_d0_entry_post_irq(WDFDEVICE device, WDF_POWER_DEVICE_STAT
 		.timer_hz = ctx->timer_hz,
 	};
 	struct pw_device *pw = NULL;
+	const char *name = NULL;
+	uint32_t maj = 0, min = 0, patch = 0;
 	char desc[128];
 	int ret;
 
@@ -398,6 +534,17 @@ static NTSTATUS pw_win_d0_entry_post_irq(WDFDEVICE device, WDF_POWER_DEVICE_STAT
 
 	ret = pw_device_probe(pw);
 	ctx->core_status = ret;
+	ctx->backend = pw_device_backend(pw);
+	__atomic_store_n(&ctx->probed, 1, __ATOMIC_RELEASE);
+	if (ctx->backend == PW_BACKEND_JM && (ctx->boot_firmware || ctx->fw_name[0]))
+		PW_WLOG(PW_LOG_INFO, "job-manager GPU: BootFirmware=%lu and FirmwareName=%s are "
+			"ignored (no firmware; the core always does its full init)",
+			(unsigned long)ctx->boot_firmware, ctx->fw_name[0] ? ctx->fw_name : "(unset)");
+	if (ctx->plat && ctx->backend != PW_BACKEND_NONE &&
+	    (ctx->backend == PW_BACKEND_CSF) != ctx->plat->csf)
+		PW_WLOG(PW_LOG_WARN, "GPU_ID says %s, but the %s board has a %s GPU",
+			ctx->backend == PW_BACKEND_CSF ? "CSF" : "job manager", ctx->plat->soc,
+			ctx->plat->csf ? "CSF" : "job-manager");
 	if (ret) {
 		/* Keep the failed device published until D0Exit: interrupts are connected, and only
 		 * the disconnect (which flushes the ISR work items) makes destroying it safe. */
@@ -409,7 +556,9 @@ static NTSTATUS pw_win_d0_entry_post_irq(WDFDEVICE device, WDF_POWER_DEVICE_STAT
 	}
 	__atomic_store_n(&ctx->core_ready, 1, __ATOMIC_RELEASE);
 	pw_device_describe(pw, desc, sizeof(desc));
-	PW_WLOG(PW_LOG_INFO, "core device up: %s", desc);
+	pw_device_drm_version(pw, &maj, &min, &patch, &name);
+	PW_WLOG(PW_LOG_INFO, "core device up: %s (DRM %s %u.%u.%u)", desc, name ? name : "?",
+		maj, min, patch);
 	return STATUS_SUCCESS;
 }
 
@@ -444,6 +593,8 @@ static NTSTATUS pw_win_d0_exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE target)
 	pw = __atomic_exchange_n(&ctx->pw, NULL, __ATOMIC_ACQ_REL);
 	if (pw)
 		pw_device_destroy(pw);
+	__atomic_store_n(&ctx->probed, 0, __ATOMIC_RELEASE);
+	ctx->backend = PW_BACKEND_NONE;
 	__atomic_store_n(&ctx->os.regs_enabled, 0, __ATOMIC_SEQ_CST);
 	ExReInitializeRundownProtection(&ctx->core_rundown); /* for the next D0Entry */
 	if (ctx->irq_spurious[0] | ctx->irq_spurious[1] | ctx->irq_spurious[2])
@@ -498,6 +649,7 @@ static NTSTATUS pw_win_device_add(WDFDRIVER driver, PWDFDEVICE_INIT init)
 	ctx->device = device;
 	pw_os_win_init(&ctx->os, device);
 	pw_win_files_init(ctx);
+	ctx->plat = pw_win_query_platform(device);
 	pw_win_read_params(ctx);
 	ctx->timer_hz = pw_win_read_cntfrq();
 
@@ -530,11 +682,15 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registr
 	WDF_DRIVER_CONFIG cfg;
 	NTSTATUS st;
 	uint32_t maj, min, patch;
+	const char *name = NULL;
 
 	pw_win_resolve_routines();
-	pw_core_drm_version(&maj, &min, &patch);
-	PW_WLOG(PW_LOG_INFO, "panwin.sys " PANWIN_VERSION_STRING " (ABI %u, panthor uAPI %u.%u.%u%s), "
-		"ExAllocatePool2 %s, MmMapIoSpaceEx %s", PANWIN_ABI_VERSION, maj, min, patch,
+	/* Without a device this is the CSF (panthor) version; a job-manager device reports
+	 * panfrost, logged per device in pw_win_d0_entry_post_irq(). */
+	pw_device_drm_version(NULL, &maj, &min, &patch, &name);
+	PW_WLOG(PW_LOG_INFO, "panwin.sys " PANWIN_VERSION_STRING " (ABI %u, CSF uAPI %s %u.%u.%u, "
+		"JM uAPI panfrost%s), ExAllocatePool2 %s, MmMapIoSpaceEx %s", PANWIN_ABI_VERSION,
+		name ? name : "panthor", maj, min, patch,
 		PANWIN_DEBUG_IOCTLS ? ", debug ioctls" : "",
 		pw_win_rt.ExAllocatePool2 ? "yes" : "no", pw_win_rt.MmMapIoSpaceEx ? "yes" : "no");
 

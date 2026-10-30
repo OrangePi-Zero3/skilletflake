@@ -19,6 +19,12 @@
  *
  * Timeouts are absolute nanoseconds on the QueryPerformanceCounter clock, which is what Mesa's
  * os_time_get_nano() returns on Windows (CLOCK_MONOTONIC on Linux).
+ *
+ * (jm-glue) PANWIN_FAKE_DRM_NAME, read at every VERSION / GET_INFO, only changes how the device
+ * presents itself, for libdrm-win's driver-name logic (drmGetDevices2, drmOpenWithType):
+ *   "panfrost"        VERSION says "panfrost", GET_INFO sets PANWIN_INFO_JM
+ *   "panfrost-nocore" VERSION fails with ENODEV (a G31 whose probe failed), GET_INFO sets JM
+ * The other ioctls keep their panthor semantics.
  */
 #include <errno.h>
 #include <stdbool.h>
@@ -39,6 +45,7 @@
 #define LX_EBADF 9
 #define LX_EFAULT 14
 #define LX_EBUSY 16
+#define LX_ENODEV 19
 #define LX_EINVAL 22
 #define LX_ENOMEM 12
 #define LX_ENOTTY 25
@@ -164,10 +171,37 @@ static void copy_field(size_t *len, char *dst, const char *src)
 	*len = l;
 }
 
+/* 0 = panthor (default), 1 = "panfrost", 2 = "panfrost-nocore" (PANWIN_FAKE_DRM_NAME). */
+static int fk_drm_name_mode(void)
+{
+	char v[32];
+	DWORD n = GetEnvironmentVariableA("PANWIN_FAKE_DRM_NAME", v, sizeof(v));
+
+	if (!n || n >= sizeof(v))
+		return 0;
+	if (!strcmp(v, "panfrost"))
+		return 1;
+	if (!strcmp(v, "panfrost-nocore"))
+		return 2;
+	return 0;
+}
+
 static int fk_version(struct fk_file *f, void *arg)
 {
 	struct drm_version *v = arg;
+	int mode = fk_drm_name_mode();
 	(void)f;
+	if (mode == 2)
+		return -LX_ENODEV;
+	if (mode == 1) {
+		v->version_major = 1;
+		v->version_minor = 5;
+		v->version_patchlevel = 0;
+		copy_field(&v->name_len, v->name, "panfrost");
+		copy_field(&v->date_len, v->date, "20180908");
+		copy_field(&v->desc_len, v->desc, "panfrost DRM (panwin fake kernel name only)");
+		return 0;
+	}
 	v->version_major = 1;
 	v->version_minor = 5;
 	v->version_patchlevel = 0;
@@ -567,7 +601,8 @@ static int fk_get_info(struct fk_file *f, void *arg)
 	struct panwin_info *i = arg;
 	memset(i, 0, sizeof(*i));
 	i->abi_version = PANWIN_ABI_VERSION;
-	i->flags = PANWIN_INFO_FW_BOOTED | PANWIN_INFO_DEBUG_BUILD;
+	i->flags = fk_drm_name_mode() ? PANWIN_INFO_JM | PANWIN_INFO_DEBUG_BUILD :
+					PANWIN_INFO_FW_BOOTED | PANWIN_INFO_DEBUG_BUILD;
 	i->drm_version_major = 1;
 	i->drm_version_minor = 5;
 	i->gpu_phys_base = 0xfb000000;

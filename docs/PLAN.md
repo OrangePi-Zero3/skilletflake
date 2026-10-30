@@ -1,6 +1,6 @@
 # panfrost-win: an open Mali GPU driver for Windows on Arm
 
-Status: plan v2, 2026-10-30. M0 and the hardware-free M3–M5 work landed, see [`docs/status/`](status/). The first board is now an Orange Pi Zero3 (Mali-G31, D4); the G610 work below is parked until an RK3588 board is available. Research behind every decision here is in [`docs/research/`](research/).
+Status: plan v2, 2026-10-30. M0 and the hardware-free M3–M5 work landed, see [`docs/status/`](status/). The first board is now an Orange Pi Zero3 (Mali-G31, D4), and its hardware-free Z0 backend has landed; the G610 work below is parked until an RK3588 board is available. Research behind every decision here is in [`docs/research/`](research/).
 
 ## Goal
 
@@ -96,12 +96,41 @@ Zero3 / G31 track (current):
 
 - **Z0 — hardware-free.** JM backend + panfrost uAPI in `kmd/core`, a mock G31 that executes job
   chains, panvk v7 under wine on the real core (like `tests/e2e`); `GPU0` ACPI node (done, AML
-  tested).
+  tested). Done except the Mesa step, see below.
 - **Z1 — GPU alive.** Zero3 firmware with `GPU0`; panwin.sys loads (test-signed), `_PSC` 0,
   GPU_ID reads as G31, soft reset, IRQs fire. `panwin-info` prints GET_PARAM values.
 - **Z2 — first job.** Kernel-written WRITE_VALUE job on JS1, done IRQ, syncobj signalled.
 - **Z3 — panvk.** vulkaninfo and a compute sample on the board.
 - **Z4 — rendering.** vkcube via win32 WSI (CPU blit); then Gallium GL via WGL.
+
+**Z0 status (2026-10-30).** The job-manager backend is written and passes against a mock G31 that
+executes WRITE_VALUE/NULL/CACHE_FLUSH job chains: GPU power-up, GET_PARAM, job slots, IRQs, reset
+and AS sharing (`pw_jm_hw.c`), panfrost BOs with per-file VA, implicit sync, heap growth on fault
+and a selectable legacy Mali LPAE page-table format (`pw_jm_mem.c`), SUBMIT/JM_CTX, slot queues,
+dependencies, 500 ms timeouts and recovery (`pw_jm_sched.c`). The device reports panfrost DRM 1.5.
+The Windows glue picks the board from the ACPI HID (`AWGP0031`), checks `_PSC` before touching the
+GPU, and ships `panwin-zero3.inf`; the bring-up guide is [`bringup/zero3.md`](bringup/zero3.md).
+`tests/e2e/run.sh jm` drives the same libdrm calls Mesa's `panfrost_kmod.c` makes through
+libdrm-win into the real core under wine (527 checks, 1000-submit stress, zero leaks). Mesa itself
+is not in that test: `panfrost_kmod.c` is excluded from the Windows build (patch 0010) and
+re-enabling it is an edit under `src/panfrost`, which needs a human author (AI-POLICY.md,
+`status/jm-arch.md` open question 1). Per-piece detail and review findings:
+`docs/status/jm-{arch,hw,mem,glue,sched,e2e}.md`.
+
+Open before or at Z1, most important first:
+- On the board: GPU_ID and feature values (the mock's are guesses), which page-table format the
+  H616 G31 accepts, whether ACPI.sys lets the driver evaluate `_PSC`, whether the raw interrupt
+  vector is the GSIV, DCDC1 voltage at 400 MHz, and whether pnputil/Inf2Cat accept the INF.
+- Reset hard-stops and resumes innocent jobs from the tail register; Linux soft-stops first. Needs
+  a soft-stop reset and a board test.
+- `pw_irq_bottom()` does not skip a late bottom half while its line is suspended (fixed for the job
+  line inside `pw_jm_hw.c`; still open on the MMU line and on CSF). The JM scheduler also relies on
+  `pw_irq_bottom()` holding the line's `bh_lock`, which no header states yet.
+- The MMU fault is cleared after heap growth rather than before; bus faults are masked on JM; AS
+  enable/disable on JM still use the shared flush sequence instead of FLUSH_MEM.
+- If GPU registers are never enabled, the ISR returns FALSE without masking the line, so a really
+  asserted line would storm.
+- `pw_device_alloc` ignores `timer_hz` (24 MHz default is right for the H616).
 
 G610 / CSF track (parked; M3–M5 kernel code exists and passes on the mock):
 

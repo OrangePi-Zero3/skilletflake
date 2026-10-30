@@ -95,10 +95,13 @@ int pw_jm_ioctl_get_param(struct pw_file *file, void *arg);
  * none of these sleep, so they may be called from the job IRQ bottom half.
  * submit: program the NEXT registers of @js and write JS_COMMAND_NEXT = START
  *   (panfrost_job.c:panfrost_job_hw_submit): HEAD_NEXT = @jc, AFFINITY_NEXT = the shader cores
- *   (panfrost_job_write_affinity), CONFIG_NEXT = @as | START_MMU | START/END_FLUSH_CLEAN_INVALIDATE
+ *   (panfrost_job_write_affinity), CONFIG_NEXT = @as | START/END_FLUSH_CLEAN_INVALIDATE
  *   | THREAD_PRI(8) | (FLUSH_REDUCTION + FLUSH_ID_NEXT = @flush_id when the GPU has it) |
- *   JOB_CHAIN_FLAG if @chain_flag (JOBCHAIN_DISAMBIGUATION). The caller checked
- *   pw_jm_slot_next_free(). The AS must stay bound (pw_jm_as_get) until the job completed.
+ *   JOB_CHAIN_FLAG if @chain_flag (JOBCHAIN_DISAMBIGUATION). (jm-hw fix: START_MMU is only
+ *   set on GPUs with HW_ISSUE_10649, a Midgard T60x erratum, as Linux does; never on Bifrost.)
+ *   The caller checked pw_jm_slot_next_free(). The AS must stay bound (pw_jm_as_get) until
+ *   the job completed. A store barrier orders the caller's job-descriptor writes before START.
+ *   No-op (logged) for a slot outside JS_PRESENT / PW_JM_NUM_SLOTS or after a failed reset.
  * next_free: JS_COMMAND_NEXT reads NOP, i.e. the NEXT registers can take a job.
  * stop: SOFT_STOP / HARD_STOP the job on @js; with JOBCHAIN_DISAMBIGUATION the _0/_1 variant
  *   selected by @chain_flag only stops the job that carries that flag.
@@ -126,7 +129,25 @@ const char *pw_jm_exception_name(uint32_t code);
 
 /* ---- job interrupt ---- */
 
-/* What the job IRQ bottom half hands the scheduler, per pass. */
+/*
+ * What the job IRQ bottom half hands the scheduler, per pass. (jm-hw clarifications:)
+ *  - A pass repeats "read RAWSTAT, clear, sample JS_STATE" until RAWSTAT is 0, as
+ *    panfrost_job.c:panfrost_jm_handle_irq does, so one slot can have BOTH a done and a failed
+ *    bit: the current job completed, then the job that followed from NEXT failed. Done always
+ *    happened first (after a failure the slot stops until the scheduler resubmits).
+ *  - For every slot in @failed the handler has already written JS_COMMAND_NEXT = NOP before
+ *    clearing JOB_INT (the hardware holds NEXT back while the error is pending), so a job that
+ *    was waiting in NEXT has not started: the scheduler resubmits it with pw_jm_slot_submit().
+ *  - @js_state holds the raw JOB_INT_JS_STATE bits (bit js = current job active, bit js + 16 =
+ *    a job waiting in NEXT) of the slots that had events in this pass, 0 for the others.
+ *  - (review) A done bit means "at least one chain completed": the JM starts NEXT without an
+ *    ack, so the current chain and the one from NEXT can both finish before the bit is
+ *    cleared and show up as one done bit. If the slot had a job in NEXT, no failed bit, and
+ *    @js_state shows neither bit of the slot, both completed (the rule Linux applies in
+ *    panfrost_job.c:panfrost_jm_handle_irq).
+ *  - (review) No event is delivered while pw_jm_hw_reset() or pw_jm_hw_fini() has the line
+ *    quiesced, even by a bottom half that was queued before (pw_jm_hw_reset_collect()).
+ */
 struct pw_jm_irq_event {
 	uint32_t done;		/* slots whose chain completed (JOB_INT bits 0-15) */
 	uint32_t failed;	/* slots whose chain failed or stopped (bits 16-31, shifted down) */
@@ -157,8 +178,26 @@ void pw_jm_job_irq_handler(struct pw_device *dev, uint32_t status);
  * The caller (pw_jm_sched.c) has stopped feeding the slots and holds its reset lock; it
  * resubmits or fails the jobs afterwards. Returns PW_OK or the reset/power error (the device is
  * then unusable: every later submit fails). Passive level, may sleep, not from a bottom half.
+ * (jm-hw) Like synchronize_irq() in Linux, it waits for a job or MMU bottom half that is
+ * running when the lines are masked, so pw_jm_sched_job_irq() must never block on a lock the
+ * caller of pw_jm_hw_reset() holds. No job event of the killed jobs is delivered: the reset
+ * clears JOB_INT. The cycle counter is restarted if it had users.
  */
 int  pw_jm_hw_reset(struct pw_device *dev);
+
+/*
+ * (review) pw_jm_hw_reset() that also hands back, in *@ev (zeroed first, also on failure), the
+ * job events still pending in JOB_INT when the slots had stopped, collected exactly like one
+ * pw_jm_job_irq_handler() pass but not delivered (Linux handles these interrupts before the
+ * reset, panfrost_job.c:panfrost_reset). @ev->done: the current chain completed - do not
+ * resubmit it. @ev->failed with status TERMINATED: the hard stop killed it; another status:
+ * it had faulted. Slots without bits had nothing running or their events were already
+ * delivered. Caveat: NEXT is cancelled just before the stop, so when a slot also had a job in
+ * NEXT and only done is set, that job either completed too (the JM had already promoted it)
+ * or never ran; the registers cannot tell which (Linux then counts it as done). @ev may be
+ * NULL (= pw_jm_hw_reset()).
+ */
+int  pw_jm_hw_reset_collect(struct pw_device *dev, struct pw_jm_irq_event *ev);
 
 /* ---- address-space slots (all files share the GPU's few AS: LRU, as panfrost) ---- */
 
@@ -184,5 +223,41 @@ void pw_jm_as_release(struct pw_device *dev, struct pw_jm_vm *jvm);
  * (pw_jm_mmu_fault): called from the MMU bottom half, must not wait for the job or GPU bottom
  * halves. The caller drops the reference with pw_jm_vm_put(). */
 struct pw_jm_vm *pw_jm_as_vm_get(struct pw_device *dev, uint32_t as);
+
+/* ---- additions (jm-hw) ---- */
+
+/*
+ * The AS LRU with the page tables given explicitly. pw_jm_as_get(dev, jvm) is
+ * pw_jm_as_get_vm(dev, jvm, pw_jm_vm_mmu(jvm)) with @key marked as a real pw_jm_vm. Here @key
+ * only identifies the user (pw_jm_as_put/pw_jm_as_release take the same key) and is never
+ * dereferenced; pw_jm_as_vm_get() returns NULL for slots bound this way. For kernel-built jobs
+ * on a bare pw_vm (Z2 bring-up self test, host tests) whose address space is not a pw_jm_vm.
+ * Same locking and return values as pw_jm_as_get(); PW_EINVAL if @vm is NULL.
+ */
+int  pw_jm_as_get_vm(struct pw_device *dev, struct pw_jm_vm *key, struct pw_vm *vm);
+
+/*
+ * Bring-up / tests: when @fn is set, pw_jm_job_irq_handler() hands each event to @fn instead
+ * of pw_jm_sched_job_irq(), so jobs submitted with the pw_jm_slot_* helpers directly never
+ * reach the scheduler. Same context as pw_jm_sched_job_irq() (job bottom half). NULL restores
+ * the scheduler. Set it while no job of the scheduler is in flight.
+ */
+typedef void (*pw_jm_irq_hook_t)(struct pw_device *dev, const struct pw_jm_irq_event *ev,
+				 void *ctx);
+void pw_jm_hw_set_irq_hook(struct pw_device *dev, pw_jm_irq_hook_t fn, void *ctx);
+
+/* The JS_AFFINITY_NEXT value pw_jm_slot_submit() programs: every present shader core
+ * (panfrost_job.c:panfrost_job_write_affinity "use all cores for now"). 0 before init. */
+uint64_t pw_jm_slot_affinity(struct pw_device *dev);
+
+/* ---- additions (jm-sched) ---- */
+
+/*
+ * How many chains the scheduler may keep in one slot (current + NEXT): 2 on GPUs with
+ * JOBCHAIN_DISAMBIGUATION (every Bifrost part in the model table), 1 without it, because the
+ * _0/_1 stop variants are needed to stop the right one of two chains
+ * (panfrost_job.c:panfrost_jm_init credit_limit). 0 before pw_jm_hw_init().
+ */
+uint32_t pw_jm_slot_depth(struct pw_device *dev);
 
 #endif /* PW_JM_HW_H */

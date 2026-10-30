@@ -6,6 +6,8 @@
 #   make clean && make SAN=thread CC=clang   ThreadSanitizer instead of ASan+UBSan
 #                     (gcc refuses the core's atomic fences under TSan)
 #   ./test_glue mmap  run tests whose name contains "mmap"
+#   ./test_plat       board identification from ACPI hardware IDs (pw_win_plat.c)
+#   ./test_stub       the -Dcore=stub core (pw_core_stub.c) behind the glue, G31 + G610 GPU_IDs
 #   PW_TEST_VERBOSE=1 ./test_glue   print driver log lines
 # These test the glue's logic (concurrency, teardown, bookkeeping), not Windows itself.
 ifeq ($(origin CC),default)
@@ -40,10 +42,21 @@ WARN_pw_win_user.c := -Wno-clobbered -Wno-unknown-warning-option
 
 all: test
 
-build: test_glue
+build: test_glue test_plat test_stub
 
 test_glue: $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+
+# The -Dcore=stub core (pw_core_stub.c) behind the same glue: the Z1 bring-up build.
+STUB_OBJS := $(addprefix $(OBJDIR)/win_,$(WIN_SRCS:.c=.o)) $(OBJDIR)/win_pw_core_stub.o \
+             $(OBJDIR)/fake_wdk.o $(OBJDIR)/test_stub.o
+
+test_stub: $(STUB_OBJS)
+	$(CC) $(STUB_OBJS) -o $@ $(LDFLAGS)
+
+# Board identification from ACPI hardware IDs (pw_win_plat.c has no OS dependencies).
+test_plat: test_plat.c $(WIN)/pw_win_plat.c $(WIN)/pw_win_plat.h
+	$(CC) $(CFLAGS) -std=c11 -I$(WIN) test_plat.c $(WIN)/pw_win_plat.c -o $@ $(LDFLAGS)
 
 $(OBJDIR)/core_%.o: $(CORE)/%.c $(HDRS) | $(OBJDIR)
 	$(CC) $(CFLAGS) -std=c11 $(CORE_INC) -c $< -o $@
@@ -57,10 +70,12 @@ $(OBJDIR)/%.o: %.c $(HDRS) | $(OBJDIR)
 $(OBJDIR):
 	mkdir -p $@
 
-test: test_glue
+test: test_glue test_plat test_stub
+	./test_plat
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 ./test_stub
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 ./test_glue
 
 clean:
-	rm -rf $(OBJDIR) test_glue
+	rm -rf $(OBJDIR) test_glue test_plat test_stub
 
 .PHONY: all build test clean

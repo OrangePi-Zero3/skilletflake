@@ -1,0 +1,83 @@
+; SPDX-License-Identifier: MIT
+;
+; panwin-zero3.inf - panfrost-win KMDF driver, Orange Pi Zero3 package: Allwinner H616/H618
+; Mali-G31 MP2 (job manager, ACPI AWGP0031 from firmware/zero3) only.
+;
+; Package layout (flat directory next to this INF):
+;   panwin-zero3.inf  panwin.sys  panwin.cat
+; No firmware file: the G31 has no MCU. The G31 sections are copies of the ones in panwin.inf
+; (which also covers the RK3588 but then needs mali_csffw.bin in the package);
+; kmd/win/tests/check_inf.py keeps them identical.
+; See docs/bringup/zero3.md. Test-signed only; UNTESTED ON HARDWARE.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = panwin.cat
+DriverVer   = 10/30/2026,0.1.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir    = 12
+Panwin_CopyFiles  = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+panwin.sys     = 1,,
+
+[Manufacturer]
+%MfgName% = Panwin,NTarm64.10.0...19041
+
+[Panwin.NTarm64.10.0...19041]
+; _HID "AWGP0031" from our Orange Pi Zero3 patch (firmware/zero3). 10.0.19041 and later covers
+; the Windows 10 22H2 / Windows 11 <= 23H2 builds the Zero3's Cortex-A53 (ARMv8.0) can run.
+%DeviceDescG31% = Panwin_Device_Zero3, ACPI\AWGP0031
+%DeviceDescG31% = Panwin_Device_Zero3, ACPI\VEN_AWGP&DEV_0031
+
+[Panwin_CopyFiles]
+panwin.sys
+
+; BEGIN G31 SECTIONS (kept identical to panwin-zero3.inf, see kmd/win/tests/check_inf.py)
+[Panwin_Device_Zero3.NT]
+CopyFiles = Panwin_CopyFiles
+
+[Panwin_Device_Zero3.NT.HW]
+AddReg = Panwin_Zero3_HW_AddReg
+
+[Panwin_Zero3_HW_AddReg]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+HKR,,DeviceCharacteristics,0x10001,0x100
+; The driver keys the RK3588 PMU check on the hardware ID and never runs it here; 0 makes the
+; intent visible in the registry too.
+HKR,,Rk3588PmuCheck,0x00010001,0
+; Evaluate the GPU0 node's _PSC (must be 0: PPU on, bus gate open, reset released) before the
+; first GPU register access (1 = on, recommended).
+HKR,,AcpiPscCheck,0x00010001,1
+
+[Panwin_Device_Zero3.NT.Services]
+AddService = panwin,0x00000002,Panwin_Service
+
+[Panwin_Device_Zero3.NT.Wdf]
+KmdfService = panwin, Panwin_WdfSect
+; END G31 SECTIONS
+
+[Panwin_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START (PnP starts it)
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\panwin.sys
+
+[Panwin_WdfSect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+ProviderName = "panfrost-win"
+MfgName      = "panfrost-win"
+DeviceDescG31 = "Arm Mali-G31 GPU (panfrost-win, test)"
+DiskName     = "panfrost-win driver package"
+ServiceName  = "panfrost-win Mali GPU driver"

@@ -1,12 +1,20 @@
 ; SPDX-License-Identifier: MIT
 ;
-; panwin.inf - panfrost-win KMDF driver for the Rockchip RK3588 Mali-G610 GPU (ACPI RKCP7410).
+; panwin.inf - panfrost-win KMDF driver for Arm Mali GPUs:
+;   Rockchip RK3588 Mali-G610 (CSF, ACPI RKCP7410, firmware/edk2-rk3588)
+;   Allwinner H616/H618 Mali-G31 MP2 (job manager, ACPI AWGP0031, firmware/zero3: Orange Pi Zero3)
 ;
 ; Package layout (flat directory next to this INF):
 ;   panwin.inf  panwin.sys  panwin.cat  mali_csffw.bin
-; mali_csffw.bin is Arm's CSF firmware (arch10.8). It is installed where pw_os_win.c looks:
+; mali_csffw.bin is Arm's CSF firmware (arch10.8), used by the G610 only. It is installed where
+; pw_os_win.c looks:
 ;   FirmwareRoot (default \SystemRoot\System32\drivers\panwin\) + arm\mali\arch10.8\mali_csffw.bin
-; See docs/bringup/windows-install.md. Test-signed only; UNTESTED ON HARDWARE.
+; The G31 needs no firmware: its install section copies panwin.sys only. Because this INF lists
+; mali_csffw.bin in [SourceDisksFiles], a package built from it must contain the file; for a
+; Zero3-only package without it use panwin-zero3.inf (same G31 sections, checked by
+; kmd/win/tests/check_inf.py).
+; See docs/bringup/windows-install.md (RK3588) and docs/bringup/zero3.md (Zero3).
+; Test-signed only; UNTESTED ON HARDWARE.
 
 [Version]
 Signature   = "$WINDOWS NT$"
@@ -36,6 +44,10 @@ mali_csffw.bin = 1,,
 ; _HID "RKCP7410" from our edk2-rk3588 patch. The ACPI enumerator reports both forms.
 %DeviceDesc% = Panwin_Device, ACPI\RKCP7410
 %DeviceDesc% = Panwin_Device, ACPI\VEN_RKCP&DEV_7410
+; _HID "AWGP0031" from our Orange Pi Zero3 patch (firmware/zero3). 10.0.19041 and later covers
+; the Windows 10 22H2 / Windows 11 <= 23H2 builds the Zero3's Cortex-A53 (ARMv8.0) can run.
+%DeviceDescG31% = Panwin_Device_Zero3, ACPI\AWGP0031
+%DeviceDescG31% = Panwin_Device_Zero3, ACPI\VEN_AWGP&DEV_0031
 
 [Panwin_Device.NT]
 CopyFiles = Panwin_CopyFiles, Panwin_FwFiles
@@ -75,12 +87,38 @@ ServiceBinary = %12%\panwin.sys
 [Panwin_Device.NT.Wdf]
 KmdfService = panwin, Panwin_WdfSect
 
+; ---- Mali-G31 (H616/H618, job manager): no firmware files, no RK3588 PMU check ----
+; BEGIN G31 SECTIONS (kept identical to panwin-zero3.inf, see kmd/win/tests/check_inf.py)
+[Panwin_Device_Zero3.NT]
+CopyFiles = Panwin_CopyFiles
+
+[Panwin_Device_Zero3.NT.HW]
+AddReg = Panwin_Zero3_HW_AddReg
+
+[Panwin_Zero3_HW_AddReg]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+HKR,,DeviceCharacteristics,0x10001,0x100
+; The driver keys the RK3588 PMU check on the hardware ID and never runs it here; 0 makes the
+; intent visible in the registry too.
+HKR,,Rk3588PmuCheck,0x00010001,0
+; Evaluate the GPU0 node's _PSC (must be 0: PPU on, bus gate open, reset released) before the
+; first GPU register access (1 = on, recommended).
+HKR,,AcpiPscCheck,0x00010001,1
+
+[Panwin_Device_Zero3.NT.Services]
+AddService = panwin,0x00000002,Panwin_Service
+
+[Panwin_Device_Zero3.NT.Wdf]
+KmdfService = panwin, Panwin_WdfSect
+; END G31 SECTIONS
+
 [Panwin_WdfSect]
 KmdfLibraryVersion = 1.15
 
 [Strings]
 ProviderName = "panfrost-win"
-MfgName      = "panfrost-win (Rockchip RK3588)"
+MfgName      = "panfrost-win"
 DeviceDesc   = "Arm Mali-G610 GPU (panfrost-win, test)"
+DeviceDescG31 = "Arm Mali-G31 GPU (panfrost-win, test)"
 DiskName     = "panfrost-win driver package"
 ServiceName  = "panfrost-win Mali GPU driver"

@@ -7,7 +7,13 @@
  * CSF command-stream executor) and registers it as transport "core":
  *
  *   PANWIN_TRANSPORT=core   route every device to it (or panwin_select_transport("core"))
- *   PANWIN_CORE_FW=<path>   mali_csffw.bin to boot (default: the build-time -Dcore_fw path)
+ *   PANWIN_CORE_MODEL=g31   (jm-glue) emulate the Orange Pi Zero3's Mali-G31 MP2 instead (job
+ *                           manager, no firmware: the core reports DRM "panfrost" and the
+ *                           panfrost ioctls; the mock's job-chain executor is kmd/tests/mock_jm.c).
+ *                           Default / "g610": the RK3588 Mali-G610 (CSF, "panthor"). Read at
+ *                           each device bring-up (first open after the last close).
+ *   PANWIN_CORE_FW=<path>   mali_csffw.bin to boot (default: the build-time -Dcore_fw path;
+ *                           not used with PANWIN_CORE_MODEL=g31)
  *   PANWIN_CORE_REPORT=1    print a one-line leak/health report when a device is torn down
  *                           (and unexpected DRM ioctl failures)
  *   PANWIN_CORE_TRACE=1     print every DRM ioctl (nr, size, result)
@@ -38,7 +44,8 @@ extern "C" {
 struct panwin_core_report {
 	uint32_t version;		/* in: PANWIN_CORE_REPORT_VERSION */
 	uint32_t device_live;		/* a core device currently exists */
-	uint32_t devices_created;	/* successful bring-ups (firmware booted) */
+	uint32_t devices_created;	/* successful bring-ups (G610: firmware booted; G31:
+					 * probed as a job-manager GPU) */
 	uint32_t devices_destroyed;
 	uint32_t bringup_failures;
 	uint32_t open_files;
@@ -54,7 +61,7 @@ struct panwin_core_report {
 	uint64_t drm_ioctls, drm_ioctl_errors;
 	uint64_t mmaps, munmaps, syncobj_events;
 	/* Mock CSF executor, summed over every CSG/CS slot (live device, else the last one
-	 * sampled before teardown): what the emulated MCU actually executed. */
+	 * sampled before teardown): what the emulated MCU actually executed. Always 0 on G31. */
 	uint64_t cs_instrs, cs_runs, cs_syncs, cs_waits, cs_doorbells;
 	uint32_t cs_fatal;		/* slots that raised CS_FATAL */
 	uint32_t cs_fatal_type;		/* exception type of the last one */
@@ -64,6 +71,18 @@ struct panwin_core_report {
  * builds with the core transport only: look it up with GetProcAddress. */
 typedef int (*panwin_core_get_report_fn)(struct panwin_core_report *r);
 #define PANWIN_CORE_GET_REPORT "panwin_core_get_report"
+
+/*
+ * (jm-e2e) State of the fence in binary syncobj @handle of DRM fd @fd, encoded like a Linux
+ * sync_file status (SYNC_IOC_FILE_INFO): 1 = signalled without error, 0 = not signalled yet,
+ * < 0 = signalled with that negative Linux errno (a failed job: -EINVAL for a GPU fault,
+ * -ECANCELED for a killed or timed-out job, -EIO after a failed reset). Returns 0, or -1 with
+ * errno EBADF (not a DRM fd), EINVAL (not a core-transport fd, no such syncobj, or no fence).
+ * Windows has no sync_file export and SYNCOBJ_WAIT ignores fence errors (as Linux does), so
+ * this is the only way to observe them; test builds only. Look it up with GetProcAddress.
+ */
+typedef int (*panwin_core_syncobj_status_fn)(int fd, uint32_t handle, int32_t *status);
+#define PANWIN_CORE_SYNCOBJ_STATUS "panwin_core_syncobj_status"
 
 #ifdef __cplusplus
 }

@@ -185,4 +185,34 @@ void pw_jm_bo_fence_set(struct pw_bo *bo, struct pw_fence *fence);
  */
 int pw_jm_mmu_fault(struct pw_device *dev, uint32_t as, uint32_t fault_status, uint64_t addr);
 
+/* ---- additions (jm-mem) ---- */
+
+/*
+ * CREATE_BO with an explicit set of accepted PANFROST_BO_* flags (like pw_bo_create_user() on
+ * panthor). pw_jm_ioctl_create_bo() passes NOEXEC | HEAP, plus WB_MMAP once PW_JM_DRM_MINOR
+ * >= 6; tests use it to exercise WB_MMAP (cached CPU mappings, SYNC_BO) at 1.5.
+ */
+int pw_jm_bo_create_user(struct pw_file *file, struct drm_panfrost_create_bo *args,
+			 uint32_t allowed_flags);
+
+/*
+ * Upper bounds on user-sized arrays (Linux is only bounded by kvmalloc): more than
+ * PW_JM_MAX_SYNC_OPS SYNC_BO ops or PW_JM_MAX_JOB_BOS SUBMIT BO handles fail with PW_ENOMEM,
+ * which is what a failed kvmalloc returns on Linux.
+ */
+#define PW_JM_MAX_SYNC_OPS	(1u << 16)
+#define PW_JM_MAX_JOB_BOS	(1u << 18)
+
+/*
+ * Notes on the implementation (pw_jm_mem.c):
+ *  - pw_jm_mmu_fault() does not use pw_jm_as_vm_get(): it resolves the faulting AS through
+ *    dev->mmu.slots[as] (read under slots_lock) and a device-wide registry of live pw_jm_vm,
+ *    and keeps the registry lock across the heap growth, so it never takes or drops a VM
+ *    reference in the MMU bottom half (the final put cannot run there). Works for any binding,
+ *    LRU (pw_jm_as_get) or direct (pw_mmu_as_bind_locked, tests).
+ *  - Lock order: registry lock -> pw_jm_vm lock (VA list, mappings, heap chunks) ->
+ *    pw_vm op_lock -> mmu.slots_lock. The per-BO fence lock and pw_jm_resv_lock are not held
+ *    across any other lock of this module (resv_lock -> fence lock only).
+ */
+
 #endif /* PW_JM_MEM_H */

@@ -1,6 +1,6 @@
 # Orange Pi Zero3 / Mali-G31 MP2: platform and GPU facts
 
-Researched 2026-10-30 for the new first hardware target (D6 in the plan). Sources: halal-beef's
+Researched 2026-10-30 for the new first hardware target (D4 in the plan). Sources: halal-beef's
 firmware (`github.com/OrangePi-Zero3/Mu-Silicium`, `UEFI-Builder`), its ACPI tables
 (`Project-Silicium/Silicium-ACPI` at 6f911ab, `SoCs/Allwinner/H616/`), Linux
 `sun50i-h616.dtsi` / `sun50i-h618-orangepi-zero3.dts` / `ccu-sun50i-h616.c` /

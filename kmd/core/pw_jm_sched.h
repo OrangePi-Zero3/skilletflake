@@ -56,7 +56,10 @@ int  pw_jm_sched_file_init(struct pw_file *file);
 /* Destroy all contexts of @file: queued jobs are dropped (fence error -ECANCELED), running ones
  * hard-stopped (panfrost_job.c:panfrost_jm_close / panfrost_jm_ctx_destroy). Returns once no
  * job of the file can touch the hardware any more; jobs may still be finishing their
- * bookkeeping in a work item and keep BO/VM references until then. */
+ * bookkeeping in a work item and keep BO/VM references until then. (jm-sched) "Touch" means
+ * "is the current job of a slot": a job cancelled out of NEXT behind another context's chain
+ * is not waited for (it cannot start; it completes with -ECANCELED at that slot's next event),
+ * and neither are queued jobs waiting for dependencies (they never start). */
 void pw_jm_sched_file_fini(struct pw_file *file);
 
 /* ---- ioctl handlers (pw_ioctl_fn, panfrost structs; errnos as Linux panfrost) ---- */
@@ -103,5 +106,43 @@ int pw_jm_ioctl_jm_ctx_destroy(struct pw_file *file, void *arg);
  * work item.
  */
 void pw_jm_sched_job_irq(struct pw_device *dev, const struct pw_jm_irq_event *ev);
+
+/* ---- additions (jm-sched) ---- */
+
+/*
+ * Limits. Context handles are 0..PW_JM_MAX_CTX_PER_FILE inclusive (panfrost_job.c
+ * MAX_JM_CTX_PER_FILE with XA_LIMIT(0, 64)); JM_CTX_CREATE on a full table fails with PW_EBUSY,
+ * which is what xa_alloc returns there. SUBMIT with more than PW_JM_MAX_IN_SYNCS in_syncs fails
+ * with PW_ENOMEM (Linux: kvmalloc_array failure; it has no other bound).
+ */
+#define PW_JM_MAX_CTX_PER_FILE	64
+#define PW_JM_MAX_IN_SYNCS	(1u << 16)
+
+/*
+ * Behaviour notes (pw_jm_sched.c), where Linux leaves room or where we differ:
+ *  - Fence errors: DONE -> 0; a fault -> -EINVAL; hard-stopped by JM_CTX_DESTROY / file close,
+ *    or never run because its context was destroyed -> -ECANCELED; the job that timed out ->
+ *    -ECANCELED, and so do the later jobs of the same context that were in that slot's
+ *    hardware queue (drm_sched_resubmit_jobs guilty-context rule); after a failed GPU reset
+ *    every later job -> -EIO (Linux has no such state).
+ *  - A cancelled job's fence is signalled only once all its dependencies signalled
+ *    (drm_sched entity teardown order), so the one-fence-per-BO implicit-sync model holds.
+ *  - A dependency on a job that is already in the hardware queue of the same slot is treated
+ *    as met (drm_sched waits for the "scheduled" fence of same-scheduler dependencies), so two
+ *    dependent jobs can be pipelined through the NEXT registers.
+ *  - Timeouts are measured from when a job becomes the current job of its slot.
+ */
+
+/* Counters for tests and debugging. */
+struct pw_jm_sched_stats {
+	uint64_t submitted;	/* SUBMITs accepted */
+	uint64_t completed;	/* fences signalled */
+	uint64_t hw_submits;	/* pw_jm_slot_submit() calls, resubmissions included */
+	uint32_t jobs_alive;	/* jobs not yet freed */
+	uint32_t timeouts;	/* jobs found guilty by the watchdog */
+	uint32_t resets;	/* GPU resets done by the scheduler */
+	uint32_t as_busy;	/* times a ready job waited because every AS was busy */
+};
+void pw_jm_sched_get_stats(struct pw_device *dev, struct pw_jm_sched_stats *st);
 
 #endif /* PW_JM_SCHED_H */

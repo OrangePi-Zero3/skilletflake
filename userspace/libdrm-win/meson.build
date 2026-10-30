@@ -90,7 +90,8 @@ idep_libdrm = declare_dependency(link_with : libdrm,
 install_headers('include/xf86drm.h', 'include/libdrm_win.h', 'include/panwin_transport.h',
                 'include/panwin_core.h')
 install_headers('../../include/drm-uapi/drm.h', '../../include/drm-uapi/drm_mode.h',
-                '../../include/drm-uapi/panthor_drm.h', subdir : 'libdrm')
+                '../../include/drm-uapi/panthor_drm.h', '../../include/drm-uapi/panfrost_drm.h',
+                subdir : 'libdrm')
 install_headers('../../include/compat/sys/ioccom.h', subdir : 'libdrm/sys')
 install_headers('../../include/panwin/panwin_ioctl.h', subdir : 'panwin')
 install_data('LICENSE', install_dir : get_option('datadir') / 'licenses' / 'libdrm-win')
@@ -128,6 +129,16 @@ if with_core
     include_directories : [inc, repo_inc], c_args : c_args, link_with : libdrm)
   test('libdrm_core', test_core, timeout : 300,
        env : ['PANWIN_TRANSPORT=core', 'WINEDEBUG=-all'])
+  # The same core on the mock Mali-G31 (Orange Pi Zero3, job manager, panfrost uAPI).
+  test_core_g31 = executable('test_libdrm_core_g31', 'tests/test_libdrm_core_g31.c',
+    include_directories : [inc, repo_inc], c_args : c_args, link_with : libdrm)
+  test('libdrm_core_g31', test_core_g31, timeout : 300,
+       env : ['PANWIN_TRANSPORT=core', 'PANWIN_CORE_MODEL=g31', 'WINEDEBUG=-all'])
+  # (jm-e2e) The G31 job path below Mesa: BOs, v7 job chains, SUBMIT, sync, faults, heap, stress.
+  test_jm = executable('test_libdrm_jm', 'tests/test_libdrm_jm.c',
+    include_directories : [inc, repo_inc], c_args : c_args, link_with : libdrm)
+  test('libdrm_jm', test_jm, timeout : 300,
+       env : ['PANWIN_TRANSPORT=core', 'PANWIN_CORE_MODEL=g31', 'WINEDEBUG=-all'])
 endif
 
 summary({'fake kernel transport' : with_fake, 'core transport (kmd/core + mock)' : with_core},

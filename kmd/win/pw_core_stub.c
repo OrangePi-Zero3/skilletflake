@@ -9,10 +9,20 @@
  * GET_CAP, PANTHOR_DEV_QUERY GPU_INFO (CSIF_INFO fails: no firmware) - plus the user MMIO
  * (LATEST_FLUSH_ID) page through pw_file_mmap_lookup(), so the glue's MMIO mapping path can be
  * exercised on hardware without the real core. No BOs, no syncobjs (ENOTTY / EINVAL).
+ *
+ * (jm-glue) The backend follows GPU_ID like the real core (pw_backend_for_gpu_id). On a
+ * job-manager GPU (Bifrost, e.g. the Zero3's Mali-G31) VERSION says "panfrost" 1.0.0, the
+ * driver ioctls are the panfrost numbers and only DRM_IOCTL_PANFROST_GET_PARAM is implemented:
+ * the raw feature registers, read when asked, with the meanings of Linux panfrost_drv.c
+ * panfrost_ioctl_get_param() / panfrost_gpu.c panfrost_gpu_init_features() (behaviour only,
+ * no code taken). That is the Z1 register dump without the real JM core; SYSTEM_TIMESTAMP is
+ * the raw TIMESTAMP register (the stub never starts the cycle counter, so it may read 0). There
+ * is no user-MMIO page on JM. Everything is read-only apart from the interrupt masks.
  * UNTESTED ON HARDWARE.
  */
 #include "pw_core.h"
 #include "panthor_drm.h"
+#include "panfrost_drm.h"
 #include "pw_fmt.h"
 
 #define STUB_PAGE_SIZE 4096u
@@ -32,6 +42,20 @@
 #define STUB_SHADER_PRESENT   0x100 /* LO/HI */
 #define STUB_TILER_PRESENT    0x110
 #define STUB_L2_PRESENT       0x120
+/* Job-manager only (Linux panfrost_regs.h meanings; 0x1C is CSF_ID on CSF). */
+#define STUB_JS_PRESENT       0x01C
+#define STUB_AFBC_FEATURES    0x04C
+#define STUB_TIMESTAMP        0x098 /* LO/HI */
+#define STUB_THREAD_MAX_THREADS 0x0A0
+#define STUB_THREAD_MAX_WG    0x0A4
+#define STUB_THREAD_MAX_BARRIER 0x0A8
+#define STUB_THREAD_FEATURES  0x0AC
+#define STUB_TEXTURE_FEATURES(n) (0x0B0 + (n) * 4)
+#define STUB_JS_FEATURES(n)   (0x0C0 + (n) * 4)
+#define STUB_COHERENCY_FEATURES 0x300
+#define STUB_THREAD_TLS_ALLOC 0x310
+#define STUB_STACK_PRESENT    0xE00 /* LO/HI */
+#define STUB_DEFAULT_TIMER_HZ 24000000u
 
 /* Interrupt blocks: RAWSTAT +0x0, CLEAR +0x4, MASK +0x8, STAT +0xC. */
 static const uint32_t stub_irq_base[PW_IRQ_COUNT] = {
@@ -43,9 +67,28 @@ static const uint32_t stub_irq_base[PW_IRQ_COUNT] = {
 struct pw_device {
 	struct pw_os *os;
 	bool boot_firmware;
+	uint32_t timer_hz;
 	uint32_t gpu_id; /* 0 until probed */
+	enum pw_backend backend;
 	uint32_t irq_count[PW_IRQ_COUNT];
 };
+
+/* Same rule as kmd/core pw_gpu.c (pw_core.h, enum pw_backend). */
+enum pw_backend pw_backend_for_gpu_id(uint32_t gpu_id)
+{
+	uint32_t arch = gpu_id >> 28;
+
+	if (arch == 6 || arch == 7)
+		return PW_BACKEND_JM;
+	if (arch >= 10 && arch <= 13)
+		return PW_BACKEND_CSF;
+	return PW_BACKEND_NONE;
+}
+
+enum pw_backend pw_device_backend(const struct pw_device *dev)
+{
+	return dev ? dev->backend : PW_BACKEND_NONE;
+}
 
 static uint64_t stub_read64(struct pw_os *os, uint32_t reg)
 {
@@ -69,6 +112,7 @@ int pw_device_alloc(const struct pw_device_params *params, struct pw_device **ou
 		return PW_ENOMEM;
 	dev->os = params->os;
 	dev->boot_firmware = params->boot_firmware;
+	dev->timer_hz = params->timer_hz ? params->timer_hz : STUB_DEFAULT_TIMER_HZ;
 	*out = dev;
 	return PW_OK;
 }
@@ -87,8 +131,12 @@ int pw_device_probe(struct pw_device *dev)
 		pw_os_log(os, PW_LOG_ERR, "core stub: GPU not responding (power domain/clock off?)");
 		return PW_EIO;
 	}
-	if (dev->boot_firmware)
+	dev->backend = pw_backend_for_gpu_id(id);
+	if (dev->boot_firmware && dev->backend != PW_BACKEND_JM)
 		pw_os_log(os, PW_LOG_WARN, "core stub: BootFirmware ignored (built with core=stub)");
+	if (dev->backend == PW_BACKEND_NONE)
+		pw_os_log(os, PW_LOG_WARN, "core stub: arch %u is neither Bifrost (JM) nor Valhall "
+			  "CSF; VERSION reports panthor", id >> 28);
 	dev->gpu_id = id;
 	stub_mask_all(os);
 	return PW_OK;
@@ -147,7 +195,7 @@ void pw_device_get_gpu_info(struct pw_device *dev, struct drm_panthor_gpu_info *
 
 	*info = (struct drm_panthor_gpu_info){ 0 };
 	info->gpu_id = dev->gpu_id;
-	info->csf_id = pw_os_reg_read32(os, STUB_CSF_ID);
+	info->csf_id = dev->backend == PW_BACKEND_JM ? 0 : pw_os_reg_read32(os, STUB_CSF_ID);
 	info->l2_features = pw_os_reg_read32(os, STUB_L2_FEATURES);
 	info->core_features = pw_os_reg_read32(os, STUB_CORE_FEATURES);
 	info->tiler_features = pw_os_reg_read32(os, STUB_TILER_FEATURES);
@@ -187,8 +235,9 @@ void pw_device_get_mmu_info(struct pw_device *dev, struct drm_panthor_mmu_info *
 
 void pw_device_describe(struct pw_device *dev, char *buf, size_t len)
 {
-	pw_win_snprintf(buf, len, "core stub: GPU_ID 0x%08x arch %u.%u, no firmware", dev->gpu_id,
-		    dev->gpu_id >> 28, (dev->gpu_id >> 24) & 0xF);
+	pw_win_snprintf(buf, len, "core stub: GPU_ID 0x%08x arch %u.%u, %s", dev->gpu_id,
+		    dev->gpu_id >> 28, (dev->gpu_id >> 24) & 0xF,
+		    dev->backend == PW_BACKEND_JM ? "job manager (GET_PARAM only)" : "no firmware");
 }
 
 /* ------------------------------------------------------------- per-file API (stub) */
@@ -202,6 +251,14 @@ void pw_core_drm_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
 	*major = 1;
 	*minor = 0;
 	*patch = 0;
+}
+
+void pw_device_drm_version(const struct pw_device *dev, uint32_t *major, uint32_t *minor,
+			   uint32_t *patch, const char **name)
+{
+	pw_core_drm_version(major, minor, patch);
+	if (name)
+		*name = (dev && dev->backend == PW_BACKEND_JM) ? "panfrost" : "panthor";
 }
 
 int pw_file_open(struct pw_device *dev, struct pw_file **out)
@@ -277,9 +334,122 @@ static int stub_dev_query(struct pw_file *file, struct drm_panthor_dev_query *q)
 	}
 }
 
+static uint32_t stub_popcount64(uint64_t v)
+{
+	uint32_t n = 0;
+
+	for (; v; v &= v - 1)
+		n++;
+	return n;
+}
+
+/* DRM_IOCTL_PANFROST_GET_PARAM on the raw registers (see the file comment). */
+static int stub_get_param(struct pw_device *dev, struct drm_panfrost_get_param *p)
+{
+	struct pw_os *os = dev->os;
+	uint32_t prm = p->param;
+
+	if (p->pad)
+		return PW_EINVAL;
+	if (prm >= DRM_PANFROST_PARAM_TEXTURE_FEATURES0 && prm <= DRM_PANFROST_PARAM_TEXTURE_FEATURES3) {
+		p->value = pw_os_reg_read32(os, STUB_TEXTURE_FEATURES(prm -
+						DRM_PANFROST_PARAM_TEXTURE_FEATURES0));
+		return PW_OK;
+	}
+	if (prm >= DRM_PANFROST_PARAM_JS_FEATURES0 && prm <= DRM_PANFROST_PARAM_JS_FEATURES15) {
+		uint32_t js = prm - DRM_PANFROST_PARAM_JS_FEATURES0;
+		uint32_t nr_js = stub_popcount64(pw_os_reg_read32(os, STUB_JS_PRESENT));
+
+		/* panfrost_gpu_init_features: only the first popcount(JS_PRESENT) are read. */
+		p->value = js < nr_js ? pw_os_reg_read32(os, STUB_JS_FEATURES(js)) : 0;
+		return PW_OK;
+	}
+	switch (prm) {
+	case DRM_PANFROST_PARAM_GPU_PROD_ID:
+		p->value = dev->gpu_id >> 16;
+		return PW_OK;
+	case DRM_PANFROST_PARAM_GPU_REVISION:
+		p->value = dev->gpu_id & 0xFFFFu;
+		return PW_OK;
+	case DRM_PANFROST_PARAM_SHADER_PRESENT:
+		p->value = stub_read64(os, STUB_SHADER_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_TILER_PRESENT:
+		p->value = stub_read64(os, STUB_TILER_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_L2_PRESENT:
+		p->value = stub_read64(os, STUB_L2_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_STACK_PRESENT:
+		p->value = stub_read64(os, STUB_STACK_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_AS_PRESENT:
+		p->value = pw_os_reg_read32(os, STUB_AS_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_JS_PRESENT:
+		p->value = pw_os_reg_read32(os, STUB_JS_PRESENT);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_L2_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_L2_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_CORE_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_CORE_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_TILER_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_TILER_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_MEM_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_MEM_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_MMU_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_MMU_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_THREAD_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_THREAD_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_MAX_THREADS:
+		p->value = pw_os_reg_read32(os, STUB_THREAD_MAX_THREADS);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
+		p->value = pw_os_reg_read32(os, STUB_THREAD_MAX_WG);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
+		p->value = pw_os_reg_read32(os, STUB_THREAD_MAX_BARRIER);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_COHERENCY_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
+		p->value = stub_popcount64(stub_read64(os, STUB_L2_PRESENT));
+		return PW_OK;
+	case DRM_PANFROST_PARAM_THREAD_TLS_ALLOC:
+		p->value = pw_os_reg_read32(os, STUB_THREAD_TLS_ALLOC);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_AFBC_FEATURES:
+		p->value = pw_os_reg_read32(os, STUB_AFBC_FEATURES);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP:
+		p->value = stub_read64(os, STUB_TIMESTAMP);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY:
+		p->value = dev->timer_hz;
+		return PW_OK;
+	case DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES:
+		p->value = (1u << PANFROST_JM_CTX_PRIORITY_LOW) |
+			   (1u << PANFROST_JM_CTX_PRIORITY_MEDIUM);
+		return PW_OK;
+	case DRM_PANFROST_PARAM_SELECTED_COHERENCY:
+		p->value = DRM_PANFROST_GPU_COHERENCY_NONE; /* _CCA 0 on both boards */
+		return PW_OK;
+	default:
+		return PW_EINVAL;
+	}
+}
+
 int pw_file_ioctl(struct pw_file *file, uint32_t nr, void *arg, uint32_t size)
 {
 	struct pw_os *os = file->dev->os;
+	bool jm = file->dev->backend == PW_BACKEND_JM;
 
 	if (nr == _IOC_NR(DRM_IOCTL_VERSION)) {
 		struct drm_version *v = arg;
@@ -290,13 +460,24 @@ int pw_file_ioctl(struct pw_file *file, uint32_t nr, void *arg, uint32_t size)
 		v->version_major = 1;
 		v->version_minor = 0;
 		v->version_patchlevel = 0;
-		ret = stub_copy_field(os, (uint64_t)(uintptr_t)v->name, &v->name_len, "panthor");
+		ret = stub_copy_field(os, (uint64_t)(uintptr_t)v->name, &v->name_len,
+				      jm ? "panfrost" : "panthor");
 		if (!ret)
 			ret = stub_copy_field(os, (uint64_t)(uintptr_t)v->date, &v->date_len, "0");
 		if (!ret)
 			ret = stub_copy_field(os, (uint64_t)(uintptr_t)v->desc, &v->desc_len,
-					      "Panthor DRM driver (panfrost-win core stub)");
+					      jm ? "panfrost DRM (panfrost-win core stub)" :
+						   "Panthor DRM driver (panfrost-win core stub)");
 		return ret;
+	}
+	if (jm) {
+		if (nr == _IOC_NR(DRM_IOCTL_PANFROST_GET_PARAM)) {
+			if (size != sizeof(struct drm_panfrost_get_param))
+				return PW_EINVAL;
+			return stub_get_param(file->dev, arg);
+		}
+		if (nr != _IOC_NR(DRM_IOCTL_GET_CAP))
+			return PW_ENOTTY;
 	}
 	if (nr == _IOC_NR(DRM_IOCTL_GET_CAP)) {
 		struct drm_get_cap *c = arg;
@@ -329,7 +510,8 @@ int pw_file_ioctl(struct pw_file *file, uint32_t nr, void *arg, uint32_t size)
 int pw_file_mmap_lookup(struct pw_file *file, uint64_t offset, uint64_t size,
 			struct pw_mmap_target *t)
 {
-	(void)file;
+	if (file->dev->backend == PW_BACKEND_JM)
+		return PW_EINVAL; /* no user-MMIO page on JM, and no BOs in the stub */
 	if (offset != DRM_PANTHOR_USER_MMIO_OFFSET_32BIT &&
 	    offset != DRM_PANTHOR_USER_MMIO_OFFSET_64BIT)
 		return PW_EINVAL; /* no BOs in the stub */

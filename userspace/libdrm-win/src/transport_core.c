@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * transport_core.c - libdrm-win transport "core": the real kmd/core in-process, on the host-test
- * mock G610 (kmd/tests/pw_os_mock.c + mock_csf.c), booting the real mali_csffw.bin.
+ * mock G610 (kmd/tests/pw_os_mock.c + mock_csf.c), booting the real mali_csffw.bin, or with
+ * PANWIN_CORE_MODEL=g31 on the mock Mali-G31 (job manager, mock_jm.c, no firmware), where the
+ * core speaks the panfrost uAPI.
  * Built only with -Dcore_transport=true (x86_64 test builds, see include/panwin_core.h).
  *
  * This file plays the part of kmd/win/pw_win_ioctl.c (the panwin.sys IOCTL layer) and must keep
@@ -10,9 +12,11 @@
  *    through pw_file_ioctl() and copied back (out bytes) on success only; failures complete
  *    with PANWIN_STATUS_FROM_ERRNO(errno). Nested user pointers are plain pointers here (the
  *    mock's pw_os_copy_{from,to}_user is memcpy).
- *  - GET_INFO, MMAP/MUNMAP (whole mappings only, BO reference held per mapping, read-only
- *    LATEST_FLUSH_ID page, writable mappings of it refused), SYNCOBJ_EVENT on a caller-created
- *    event (the "kernel" duplicates the handle, sets it once and closes its reference).
+ *  - GET_INFO (the device's own DRM version, PANWIN_INFO_JM on the G31), MMAP/MUNMAP (whole
+ *    mappings only, BO reference held per mapping, read-only LATEST_FLUSH_ID page on CSF,
+ *    writable mappings of it refused; on JM the core refuses the MMIO offsets with EINVAL),
+ *    SYNCOBJ_EVENT on a caller-created event (the "kernel" duplicates the handle, sets it once
+ *    and closes its reference).
  *  - Close of the last handle: cancel pending notifies, tear down mappings, pw_file_close().
  * Concurrent ioctls on one file are allowed (libdrm-win keeps the file alive while one runs).
  * Not a driver and never run on hardware.
@@ -62,6 +66,7 @@ struct core_notify {
 
 struct core_file {
 	struct pw_file *pwf;
+	enum pw_backend backend;	/* of g.dev, fixed while the file is open */
 	SRWLOCK lock;		/* maps, notifies */
 	struct core_map *maps;
 	struct core_notify *notifies;
@@ -74,6 +79,7 @@ static struct {
 	SRWLOCK lock;		/* everything below except the counters */
 	struct pw_os *os;
 	struct pw_device *dev;
+	enum mock_model model;	/* of the live device (PANWIN_CORE_MODEL at bring-up) */
 	uint32_t nfiles;
 	void *flush_page;	/* LATEST_FLUSH_ID page: zeros, PAGE_READONLY */
 	struct panwin_core_report rep;
@@ -119,9 +125,12 @@ static int32_t st_pw(int ret)
 /* ---- mock CSF executor statistics ---- */
 
 /* Accumulate what every CS slot executed since the last sample (a slot whose counters went
- * backwards was reset/reused: count it from zero). Caller holds g.lock (device alive). */
+ * backwards was reset/reused: count it from zero). Caller holds g.lock (device alive).
+ * The G31 has no command-stream executor: nothing to sample. */
 static void cs_sample(void)
 {
+	if (g.model != MOCK_MODEL_G610)
+		return;
 	EnterCriticalSection(&g.cs_lock);
 	for (unsigned int i = 0; i < CORE_NCSG; i++) {
 		for (unsigned int j = 0; j < CORE_NCS; j++) {
@@ -147,15 +156,46 @@ static void cs_sample(void)
 
 /* ---- device lifetime ---- */
 
+/* PANWIN_CORE_MODEL: "g610" (default, RK3588, CSF) or "g31" (H616, job manager). -1 if unknown. */
+static int core_model(enum mock_model *m)
+{
+	char v[16];
+	DWORD n = GetEnvironmentVariableA("PANWIN_CORE_MODEL", v, sizeof(v));
+
+	*m = MOCK_MODEL_G610;
+	if (!n)
+		return 0;
+	if (n >= sizeof(v))
+		return -1;
+	if (!_stricmp(v, "g610"))
+		return 0;
+	if (!_stricmp(v, "g31")) {
+		*m = MOCK_MODEL_G31;
+		return 0;
+	}
+	return -1;
+}
+
 /* Caller holds g.lock exclusive. */
 static int core_device_up(void)
 {
 	struct mock_config cfg = { 0 };
 	struct pw_device_params p = { 0 };
 	static char fw[MAX_PATH];
+	enum mock_model model;
+	bool ok;
 	DWORD n;
 	int ret;
 
+	if (core_model(&model)) {
+		fprintf(stderr, "libdrm-win core: PANWIN_CORE_MODEL must be g610 or g31\n");
+		g.rep.bringup_failures++;
+		return -EINVAL;
+	}
+	if (model == MOCK_MODEL_G31) {
+		fw[0] = '\0';	/* job manager: no firmware */
+		goto mock;
+	}
 	n = GetEnvironmentVariableA("PANWIN_CORE_FW", fw, sizeof(fw));
 	if (!n || n >= sizeof(fw))
 		snprintf(fw, sizeof(fw), "%s", PANWIN_CORE_FW_DEFAULT);
@@ -172,22 +212,28 @@ static int core_device_up(void)
 			return -ENOMEM;
 	}
 
-	cfg.fw_path = fw;
+mock:
+	cfg.model = model;
+	cfg.fw_path = fw[0] ? fw : NULL;
 	/* User BOs read as zero, as on Linux. PANWIN_CORE_POISON=1 keeps the mock's default 0xa5
 	 * poison (repro for the mock ignoring PW_MEM_ZEROED, docs/status/e2e.md). */
 	cfg.honor_zeroed = !env_set("PANWIN_CORE_POISON");
 	g.os = mock_create(&cfg);	/* aborts on allocation failure */
 	p.os = g.os;
-	p.boot_firmware = true;
+	p.boot_firmware = true;	/* CSF; ignored by the core on JM */
 	ret = pw_device_alloc(&p, &g.dev);
 	if (!ret) {
 		/* As kmd/win: publish the device to the "ISR" before probe unmasks interrupts. */
 		mock_attach_irq(g.os, g.dev);
 		ret = pw_device_probe(g.dev);
 	}
-	if (ret || !pw_device_fw_booted(g.dev)) {
-		fprintf(stderr, "libdrm-win core: device bring-up failed (%d, fw %s)\n", ret,
-			g.dev && pw_device_fw_booted(g.dev) ? "booted" : "not booted");
+	/* CSF: up means the firmware booted; JM: the probe picked the job-manager backend. */
+	ok = !ret && (model == MOCK_MODEL_G31 ? pw_device_backend(g.dev) == PW_BACKEND_JM :
+						 pw_device_fw_booted(g.dev));
+	if (!ok) {
+		fprintf(stderr, "libdrm-win core: device bring-up failed (%d, %s)\n", ret,
+			model == MOCK_MODEL_G31 ? "mock G31" :
+			g.dev && pw_device_fw_booted(g.dev) ? "fw booted" : "fw not booted");
 		mock_detach_irq(g.os);
 		if (g.dev)
 			pw_device_destroy(g.dev);
@@ -197,6 +243,7 @@ static int core_device_up(void)
 		g.rep.bringup_failures++;
 		return -ENODEV;
 	}
+	g.model = model;
 	memset(g.last, 0, sizeof(g.last));
 	g.rep.devices_created++;
 	g.rep.device_live = 1;
@@ -248,9 +295,13 @@ static int core_enumerate(void)
 
 static int core_device_path(int index, char *buf, size_t len)
 {
+	enum mock_model m;
+
 	if (index != 0)
 		return -ENOENT;
-	snprintf(buf, len, "core:mock-g610");
+	if (core_model(&m))
+		return -EINVAL;
+	snprintf(buf, len, "core:mock-%s", m == MOCK_MODEL_G31 ? "g31" : "g610");
 	return 0;
 }
 
@@ -271,6 +322,7 @@ static int core_open(int index, void **file)
 	if (!g.dev)
 		ret = core_device_up();
 	if (!ret) {
+		cf->backend = pw_device_backend(g.dev);
 		ret = pw_file_open(g.dev, &cf->pwf);
 		if (ret) {
 			ret = -ENOMEM;
@@ -394,9 +446,10 @@ static int core_mmap(struct core_file *cf, struct panwin_mmap *a)
 		}
 		m->bo = t.bo;
 		m->user_va = m->view + t.offset_in_obj;
-	} else if (t.kind == PW_MMAP_MMIO) {
+	} else if (t.kind == PW_MMAP_MMIO && cf->backend == PW_BACKEND_CSF) {
 		/* Only the LATEST_FLUSH_ID page (panthor_device.c:~470 panthor_device_mmap_io):
-		 * a static zero page stands in for the register. */
+		 * a static zero page stands in for the register. panthor only: the core already
+		 * refuses these offsets on JM. */
 		if (a->size != CORE_PAGE) {
 			free(m);
 			return PW_EINVAL;
@@ -502,13 +555,15 @@ static int32_t core_get_info(void *buf, uint32_t out_size, uint32_t *returned)
 	if (out_size < sizeof(*pi))
 		return STATUS_BUFFER_TOO_SMALL_;
 	memset(pi, 0, sizeof(*pi));
-	pw_core_drm_version(&maj, &min, &patch);
 	pi->abi_version = PANWIN_ABI_VERSION;
+	AcquireSRWLockShared(&g.lock);
+	/* As kmd/win pw_win_get_info(): the device's own version (panthor without one). */
+	pw_device_drm_version(g.dev, &maj, &min, &patch, NULL);
 	pi->drm_version_major = maj;
 	pi->drm_version_minor = min;
-	AcquireSRWLockShared(&g.lock);
 	if (g.dev) {
-		pi->flags = pw_device_fw_booted(g.dev) ? PANWIN_INFO_FW_BOOTED : 0;
+		pi->flags = (pw_device_fw_booted(g.dev) ? PANWIN_INFO_FW_BOOTED : 0) |
+			    (pw_device_backend(g.dev) == PW_BACKEND_JM ? PANWIN_INFO_JM : 0);
 		pw_device_describe(g.dev, pi->description, sizeof(pi->description));
 	} else {
 		snprintf(pi->description, sizeof(pi->description), "core transport: no device");
@@ -529,7 +584,8 @@ static int32_t core_drm_ioctl(struct core_file *cf, uint32_t nr, void *buf, uint
 	if (in_size > CORE_DRM_ARG_MAX || out_size > in_size)
 		return st_errno(EINVAL);
 	memcpy(sysbuf, buf, in_size);
-	if (nr == 0x40 + DRM_PANTHOR_GROUP_DESTROY) {
+	/* panthor only: on JM 0x40 + 0x0a is DRM_PANFROST_JM_CTX_CREATE. */
+	if (cf->backend == PW_BACKEND_CSF && nr == 0x40 + DRM_PANTHOR_GROUP_DESTROY) {
 		AcquireSRWLockShared(&g.lock);
 		cs_sample(); /* before the slot is torn down */
 		ReleaseSRWLockShared(&g.lock);
@@ -636,5 +692,50 @@ __declspec(dllexport) int panwin_core_get_report(struct panwin_core_report *r)
 	r->mmaps = (uint64_t)c_mmaps;
 	r->munmaps = (uint64_t)c_munmaps;
 	r->syncobj_events = (uint64_t)c_events;
+	return 0;
+}
+
+/*
+ * Test hook (jm-e2e): the state of the fence in binary syncobj @handle of DRM fd @fd, encoded like
+ * a Linux sync_file's status (SYNC_IOC_FILE_INFO: 1 signalled, 0 active, < 0 the fence error).
+ * Windows has no sync_file export, and SYNCOBJ_WAIT succeeds whatever the fence error is (as on
+ * Linux), so this is how a test sees a failed job's -EINVAL / -ECANCELED. See panwin_core.h.
+ * The core's pw_sync.h / pw_fence.h cannot be included here: pw_internal.h defines libdrm-win's own
+ * struct pw_file. cf->pwf is the core's file, passed through that name as everywhere in this file.
+ */
+struct pw_fence;
+int pw_syncobj_find_fence(struct pw_file *file, uint32_t handle, uint64_t point, uint32_t flags,
+			  uint64_t deadline_ns, struct pw_fence **out);
+bool pw_fence_is_signalled(struct pw_fence *f);
+int pw_fence_error(struct pw_fence *f);
+void pw_fence_put(struct pw_fence *f);
+
+__declspec(dllexport) int panwin_core_syncobj_status(int fd, uint32_t handle, int32_t *status);
+__declspec(dllexport) int panwin_core_syncobj_status(int fd, uint32_t handle, int32_t *status)
+{
+	struct pw_file *f = pw_file_get(fd);
+	struct pw_fence *fence = NULL;
+	struct core_file *cf;
+	int ret;
+
+	if (!f)
+		return -1;	/* errno = EBADF */
+	if (f->tp != &pw_transport_core || !status) {
+		pw_file_put(f);
+		errno = EINVAL;
+		return -1;
+	}
+	cf = f->tfile;
+	ret = pw_syncobj_find_fence(cf->pwf, handle, 0, 0, 0, &fence);
+	if (!ret) {
+		*status = pw_fence_is_signalled(fence) ? (pw_fence_error(fence) ?
+							   pw_fence_error(fence) : 1) : 0;
+		pw_fence_put(fence);
+	}
+	pw_file_put(f);
+	if (ret) {
+		errno = -ret;	/* EINVAL: no such syncobj, or no fence */
+		return -1;
+	}
 	return 0;
 }

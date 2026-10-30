@@ -8,6 +8,7 @@
  * with errno set; drmSyncobjWait/TimelineWait return -errno; drmGetDevice* return -errno.
  */
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -219,21 +220,88 @@ int drmAvailable(void)
 	return pw_transport()->enumerate() > 0;
 }
 
+/* ---- driver name of a device (what its DRM_IOCTL_VERSION says) ---- */
+
+#define PW_DRV_NAME_MAX 32
+
+/*
+ * The DRM driver name behind an open transport file: DRM_IOCTL_VERSION's name when the kernel
+ * has a core device; otherwise PANWIN_INFO_JM from GET_INFO says "panfrost"; otherwise (no
+ * GPU probed, or an older panwin.sys) "panthor", what libdrm-win always assumed before.
+ */
+static void tfile_driver_name(const struct panwin_transport *tp, void *tfile, char *buf,
+			      size_t len)
+{
+	struct drm_version v;
+	struct panwin_info info;
+	uint32_t returned = 0;
+	char name[PW_DRV_NAME_MAX];
+
+	memclear(v);
+	v.name = name;
+	v.name_len = sizeof(name) - 1;
+	if (!tp->ioctl(tfile, PANWIN_IOCTL_DRM(_IOC_NR(DRM_IOCTL_VERSION)), &v, sizeof(v),
+		       sizeof(v), &returned) && returned == sizeof(v) && v.name_len &&
+	    v.name_len < sizeof(name)) {
+		name[v.name_len] = '\0';
+		snprintf(buf, len, "%s", name);
+		return;
+	}
+	memset(&info, 0, sizeof(info));
+	returned = 0;
+	if (!tp->ioctl(tfile, PANWIN_IOCTL_GET_INFO, &info, sizeof(info), sizeof(info), &returned) &&
+	    returned >= offsetof(struct panwin_info, flags) + sizeof(info.flags) &&
+	    (info.flags & PANWIN_INFO_JM)) {
+		snprintf(buf, len, "panfrost");
+		return;
+	}
+	snprintf(buf, len, "panthor");
+}
+
+/* Same for device @index: opens one transport file just for the question. */
+static void device_driver_name(int index, char *buf, size_t len)
+{
+	const struct panwin_transport *tp = pw_transport();
+	void *tfile = NULL;
+
+	if (tp->open(index, &tfile)) {
+		snprintf(buf, len, "panthor");
+		return;
+	}
+	tfile_driver_name(tp, tfile, buf, len);
+	tp->close(tfile);
+}
+
+/*
+ * Like libdrm: open the first device whose driver name is @name (any device if NULL). The name
+ * is the device's own ("panthor" on the RK3588 G610, "panfrost" on the H616 G31).
+ */
 int drmOpenWithType(const char *name, const char *busid, int type)
 {
-	char node[32];
+	char node[32], drv[PW_DRV_NAME_MAX];
 	int n = pw_transport()->enumerate();
+	int index = -1;
 
 	(void)busid;
-	if (name && strcmp(name, "panthor")) {
-		errno = ENODEV;
-		return -1;
-	}
 	if (n <= 0) {
 		errno = n < 0 ? -n : ENODEV;
 		return -1;
 	}
-	pw_format_node(node, sizeof(node), 0, type == DRM_NODE_RENDER ? DRM_NODE_RENDER : DRM_NODE_PRIMARY);
+	for (int i = 0; i < n && index < 0; i++) {
+		if (!name) {
+			index = i;
+			break;
+		}
+		device_driver_name(i, drv, sizeof(drv));
+		if (!strcmp(name, drv))
+			index = i;
+	}
+	if (index < 0) {
+		errno = ENODEV;
+		return -1;
+	}
+	pw_format_node(node, sizeof(node), index,
+		       type == DRM_NODE_RENDER ? DRM_NODE_RENDER : DRM_NODE_PRIMARY);
 	return panwin_open(node, 0);
 }
 
@@ -256,20 +324,42 @@ int drmClose(int fd)
 
 /* ---- devices ---- */
 
-/* Matches the Linux DT node of the RK3588 GPU so existing matching logic keeps working. */
-static const char platform_fullname[] = "/gpu@fb000000";
-static const char *const platform_compatible[] = { "rockchip,rk3588-mali", "arm,mali-valhall-csf" };
+/*
+ * Platform bus info per driver name, matching the Linux DT node of each board's GPU so existing
+ * matching logic keeps working: RK3588 (panthor) and Allwinner H616/H618 (panfrost; Linux
+ * sun50i-h616.dtsi gpu@1800000).
+ */
+struct pw_platform_info {
+	const char *driver;
+	const char *fullname;
+	const char *compatible[2];
+};
+static const struct pw_platform_info platform_infos[] = {
+	{ "panthor", "/gpu@fb000000", { "rockchip,rk3588-mali", "arm,mali-valhall-csf" } },
+	{ "panfrost", "/gpu@1800000", { "allwinner,sun50i-h616-mali", "arm,mali-bifrost" } },
+};
+
+static const struct pw_platform_info *platform_for_driver(const char *driver)
+{
+	for (size_t i = 0; i < PW_ARRAY_SIZE(platform_infos); i++)
+		if (!strcmp(driver, platform_infos[i].driver))
+			return &platform_infos[i];
+	return &platform_infos[0]; /* unknown: the pre-JM default */
+}
 
 /* One allocation per device (freed by drmFreeDevice with a single free()), like libdrm. */
-static drmDevicePtr make_device(int index)
+static drmDevicePtr make_device(int index, const char *driver)
 {
+	const struct pw_platform_info *pi = platform_for_driver(driver);
+	const char *const *platform_compatible = pi->compatible;
+	const size_t ncompat = PW_ARRAY_SIZE(pi->compatible);
 	size_t compat_strs = 0;
-	for (size_t i = 0; i < PW_ARRAY_SIZE(platform_compatible); i++)
+	for (size_t i = 0; i < ncompat; i++)
 		compat_strs += strlen(platform_compatible[i]) + 1;
 
 	size_t sz = sizeof(drmDevice) + DRM_NODE_MAX * sizeof(char *) + DRM_NODE_MAX * DRM_NODE_NAME_MAX +
 		    sizeof(drmPlatformBusInfo) + sizeof(drmPlatformDeviceInfo) +
-		    (PW_ARRAY_SIZE(platform_compatible) + 1) * sizeof(char *) + compat_strs + 16;
+		    (ncompat + 1) * sizeof(char *) + compat_strs + 16;
 	char *mem = calloc(1, sz);
 	if (!mem)
 		return NULL;
@@ -285,15 +375,15 @@ static drmDevicePtr make_device(int index)
 	d->deviceinfo.platform = (drmPlatformDeviceInfoPtr)p;
 	p += sizeof(drmPlatformDeviceInfo);
 	d->deviceinfo.platform->compatible = (char **)p;
-	p += (PW_ARRAY_SIZE(platform_compatible) + 1) * sizeof(char *);
-	for (size_t i = 0; i < PW_ARRAY_SIZE(platform_compatible); i++) {
+	p += (ncompat + 1) * sizeof(char *);
+	for (size_t i = 0; i < ncompat; i++) {
 		size_t l = strlen(platform_compatible[i]) + 1;
 		memcpy(p, platform_compatible[i], l);
 		d->deviceinfo.platform->compatible[i] = p;
 		p += l;
 	}
 	snprintf(d->businfo.platform->fullname, sizeof(d->businfo.platform->fullname), "%s",
-		 platform_fullname);
+		 pi->fullname);
 
 	/* Only a render node exists: panwin.sys has no KMS / master concept. */
 	d->available_nodes = 1 << DRM_NODE_RENDER;
@@ -319,7 +409,10 @@ int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
 		return -EINVAL;
 	int count = n < max_devices ? n : max_devices;
 	for (int i = 0; i < count; i++) {
-		devices[i] = make_device(i);
+		char drv[PW_DRV_NAME_MAX];
+
+		device_driver_name(i, drv, sizeof(drv));
+		devices[i] = make_device(i, drv);
 		if (!devices[i]) {
 			drmFreeDevices(devices, i);
 			return -ENOMEM;
@@ -336,6 +429,7 @@ int drmGetDevices(drmDevicePtr devices[], int max_devices)
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
 {
 	struct pw_file *f;
+	char drv[PW_DRV_NAME_MAX];
 	int index;
 
 	(void)flags;
@@ -345,8 +439,9 @@ int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
 	if (!f)
 		return -EBADF;
 	index = f->index;
+	tfile_driver_name(f->tp, f->tfile, drv, sizeof(drv));
 	pw_file_put(f);
-	*device = make_device(index);
+	*device = make_device(index, drv);
 	return *device ? 0 : -ENOMEM;
 }
 
@@ -384,7 +479,9 @@ int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device)
 		return index;
 	if (index >= pw_transport()->enumerate())
 		return -ENODEV;
-	*device = make_device(index);
+	char drv[PW_DRV_NAME_MAX];
+	device_driver_name(index, drv, sizeof(drv));
+	*device = make_device(index, drv);
 	return *device ? 0 : -ENOMEM;
 }
 

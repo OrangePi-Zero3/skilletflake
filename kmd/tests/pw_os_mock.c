@@ -13,6 +13,7 @@
  *  - MMU: AS_COMMAND keeps AS_STATUS.ACTIVE for a few reads, UPDATE latches TRANSTAB/MEMATTR/
  *    TRANSCFG, LOCK/UNLOCK tracked (UNLOCK without an intervening GPU cache flush is flagged),
  *    REQ_COMPLETE bits (16+as) raised in MMU RAWSTAT. Page tables are walked from "DRAM".
+ *    (jm-mem) G31: FLUSH_PT/FLUSH_MEM end a LOCK; legacy Mali LPAE tables are walked too.
  *  - MCU: MCU_CONTROL=AUTO checks the code/shared mappings through AS0, writes a global/CSG/CS
  *    interface into the shared section (through AS0) and raises JOB_INT GLOBAL_IF; doorbell 0
  *    echoes GLB req->ack and doorbell_req->doorbell_ack, raising GLOBAL_IF if ack_irq_mask says so.
@@ -186,6 +187,9 @@ static void *mock_memmem(const void *h, size_t hl, const void *n, size_t nl)
 #define R_JOB_CONTROL_EXTRA	0x1010u		/* JS_STATE..: after the JOB_INT block */
 #define R_JOB_CONTROL_END	0x2000u
 #define G31_REG_WINDOW		0x40000u	/* gpu@1800000 is 0x40000 bytes */
+#define R_LATEST_FLUSH_ID	0x38		/* (jm-hw) */
+#define R_CYCLE_COUNT		0x90
+#define R_TIMESTAMP		0x98
 
 #define GPU_IRQ_RESET_COMPLETED		(1u << 8)
 #define GPU_IRQ_POWER_CHANGED_BOTH	(3u << 9)
@@ -310,6 +314,10 @@ struct pw_os {
 	long allocs, mems, syncs;
 	struct mock_csf *csf;
 	struct mock_jm *jm;		/* (jm-arch) G31 model */
+	/* (jm-hw) G31 cycle counter: GPU_CYCLE_COUNT runs at a nominal 400 MHz while started */
+	uint64_t jm_cycles_acc, jm_cycles_since_ns;
+	bool jm_cycles_on;
+	uint32_t fail_mem_allocs;	/* (jm-mem) mock_fail_mem_allocs() */
 };
 
 static const uint32_t int_base[3] = { 0x1000, 0x2000, 0x20 };
@@ -364,6 +372,14 @@ int pw_os_mem_alloc(struct pw_os *os, size_t size, uint32_t flags, struct pw_os_
 		return PW_EINVAL;
 	if (size > (256u << 20))
 		return PW_ENOMEM;	/* keep fuzzed inputs from eating the host */
+	/* (jm-mem) injected allocation failures (mock_fail_mem_allocs) */
+	pthread_mutex_lock(&os->lock);
+	if (os->fail_mem_allocs) {
+		os->fail_mem_allocs--;
+		pthread_mutex_unlock(&os->lock);
+		return PW_ENOMEM;
+	}
+	pthread_mutex_unlock(&os->lock);
 	size = (size + 0xfff) & ~(size_t)0xfff;
 	npages = size >> 12;
 	m = calloc(1, sizeof(*m));
@@ -808,6 +824,66 @@ long mock_live_sync(struct pw_os *os) { return __atomic_load_n(&os->syncs, __ATO
 /* emulated GPU MMU                                                                           */
 /* ------------------------------------------------------------------------------------------ */
 
+/*
+ * (jm-mem) Legacy Mali LPAE walk (G31 model, TRANSCFG ADRMODE_LEGACY): written from the format
+ * facts listed in mock_gpu.h, independently of the core's pw_mmu.c. Always 4 levels / 48-bit
+ * input; 0b11 = table at levels 0-2, 0b01 = block (levels 1-2) or page (level 3), anything else
+ * at a level is a translation fault; bit 6 must be set for reads, bit 7 for writes; XN (54)
+ * forbids execution. There is no access flag.
+ */
+#define L_RD		(1ull << 6)
+#define L_WR		(1ull << 7)
+
+static int translate_lpae_locked(struct pw_os *os, unsigned int as, uint64_t va, char access,
+				 uint64_t *pa, int *level, uint64_t *pte)
+{
+	struct mock_as_state *st = &os->as[as];
+	uint64_t table;
+	unsigned int lvl;
+
+	if (os->cfg.model != MOCK_MODEL_G31) {
+		model_error(os, "AS%u: legacy TRANSCFG on a GPU without Mali LPAE support", as);
+		return 0xc0;
+	}
+	if ((st->transtab & 3) != 3) {
+		model_error(os, "AS%u: legacy TRANSTAB 0x%llx without ADRMODE_TABLE", as,
+			    (unsigned long long)st->transtab);
+		return 0xc0;
+	}
+	if (va >> 48)
+		return 0xc0;
+	table = st->transtab & D_OA;
+	for (lvl = 0;; lvl++) {
+		unsigned int shift = 12 + 9 * (3 - lvl);
+		unsigned int idx = (unsigned int)(va >> shift) & 511;
+		uint8_t *p = pa_host_locked(os, table + idx * 8);
+		uint64_t e;
+
+		if (!p)
+			return 0x80;
+		memcpy(&e, p, 8);
+		if (lvl < 3 && (e & 3) == 3) {
+			table = e & D_OA;
+			continue;
+		}
+		if ((e & 3) != 1 || lvl == 0)
+			return 0xc0 + (int)lvl;	/* invalid, or a table/reserved encoding */
+		if ((access == 'r' && !(e & L_RD)) || (access == 'w' && !(e & L_WR)) ||
+		    (access == 'x' && (e & D_XN)))
+			return 0xc8 + (int)lvl;
+		if (pa) {
+			uint64_t bs = 1ull << shift;
+
+			*pa = (e & D_OA & ~(bs - 1)) | (va & (bs - 1));
+		}
+		if (level)
+			*level = (int)lvl;
+		if (pte)
+			*pte = e;
+		return 0;
+	}
+}
+
 static int translate_locked(struct pw_os *os, unsigned int as, uint64_t va, char access,
 			    uint64_t *pa, int *level, uint64_t *pte)
 {
@@ -817,6 +893,8 @@ static int translate_locked(struct pw_os *os, unsigned int as, uint64_t va, char
 
 	if (as >= 16 || !st->enabled)
 		return 0xc0;
+	if ((st->transcfg & 0xf) == 0)		/* (jm-mem) ADRMODE_LEGACY */
+		return translate_lpae_locked(os, as, va, access, pa, level, pte);
 	if ((st->transcfg & 0xf) != 6) {
 		model_error(os, "AS%u: TRANSCFG 0x%llx is not AARCH64_4K", as,
 			    (unsigned long long)st->transcfg);
@@ -979,6 +1057,67 @@ void mock_reg_set_locked(struct pw_os *os, uint32_t off, uint32_t v)
 static bool is_jm(const struct pw_os *os)
 {
 	return os->cfg.model == MOCK_MODEL_G31;
+}
+
+/* ---- (jm-hw) more mock_internal.h helpers for mock_jm.c ---- */
+
+uint32_t mock_rawstat_locked(struct pw_os *os, unsigned int line)
+{
+	return line < 3 ? os->rawstat[line] : 0;
+}
+
+bool mock_as_enabled_locked(struct pw_os *os, unsigned int as)
+{
+	return as < 16 && os->as[as].enabled;
+}
+
+int mock_gpu_translate_locked(struct pw_os *os, unsigned int as, uint64_t va, char access)
+{
+	return translate_locked(os, as, va, access, NULL, NULL, NULL);
+}
+
+/* GPU_TIMESTAMP counts the 24 MHz system counter: derived from the monotonic clock. */
+uint64_t mock_gpu_timestamp_locked(struct pw_os *os)
+{
+	(void)os;
+	return mono_now_ns() * 3u / 125u;
+}
+
+uint64_t mock_gpu_cycles_locked(struct pw_os *os)
+{
+	uint64_t v = os->jm_cycles_acc;
+
+	if (os->jm_cycles_on)
+		v += (mono_now_ns() - os->jm_cycles_since_ns) * 2u / 5u;
+	return v;
+}
+
+static void jm_cycles_set_locked(struct pw_os *os, bool on)
+{
+	if (on == os->jm_cycles_on)
+		return;
+	if (on) {
+		os->jm_cycles_since_ns = mono_now_ns();
+		os->regs[R_GPU_STATUS / 4] |= 1u << 6;
+	} else {
+		os->jm_cycles_acc = mock_gpu_cycles_locked(os);
+		os->regs[R_GPU_STATUS / 4] &= ~(1u << 6);
+	}
+	os->jm_cycles_on = on;
+}
+
+void mock_kick_locked(struct pw_os *os)
+{
+	pthread_cond_broadcast(&os->cond);
+}
+
+void mock_cond_wait_locked(struct pw_os *os, uint64_t timeout_ns)
+{
+	struct timespec ts;
+
+	mono_timespec(&ts);
+	ts_add_ns(&ts, timeout_ns);
+	mono_cond_timedwait(&os->cond, &os->lock, &ts);
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -1220,6 +1359,10 @@ static void soft_reset_locked(struct pw_os *os)
 		os->regs[R_SHADER_READY / 4] = os->regs[R_SHADER_READY / 4 + 1] = 0;
 		os->regs[R_TILER_READY / 4] = os->regs[R_TILER_READY / 4 + 1] = 0;
 		os->regs[R_STACK_READY / 4] = os->regs[R_STACK_READY / 4 + 1] = 0;
+		/* (jm-hw) a reset drops pending job/MMU interrupts and stops the cycle counter */
+		os->rawstat[0] = 0;
+		os->rawstat[1] = 0;
+		jm_cycles_set_locked(os, false);
 		mock_jm_reset_locked(os);
 	} else {
 		mock_csf_reset_locked(os);
@@ -1265,11 +1408,22 @@ static void as_command_locked(struct pw_os *os, unsigned int as, uint32_t cmd)
 		break;
 	case 4:		/* FLUSH_PT */
 	case 5:		/* FLUSH_MEM */
+		/* (jm-mem) Bifrost JM: the flush commands flush the L2 and the walk caches for
+		 * the locked region and end the lock (Linux panfrost never sends UNLOCK after
+		 * them). The G610 model only counts them. */
+		if (cmd == 4)
+			st->flush_pts++;
+		else
+			st->flush_mems++;
+		if (os->cfg.model == MOCK_MODEL_G31)
+			st->locked = false;
 		break;
 	default:
 		model_error(os, "AS%u: bad command %u", as, cmd);
 	}
 	raise_locked(os, 1, 1u << (16 + as));	/* REQ_COMPLETE, must stay masked */
+	if (is_jm(os))
+		mock_jm_as_command_locked(os, as, cmd);	/* (jm-hw) retry/kill stalled jobs */
 }
 
 /*
@@ -1289,15 +1443,16 @@ static bool jm_gpu_reg_write_locked(struct pw_os *os, uint32_t off, uint32_t v)
 			soft_reset_locked(os);
 			break;
 		case 0x05:		/* CYCLE_COUNT_START */
-			os->regs[R_GPU_STATUS / 4] |= 1u << 6;
+			jm_cycles_set_locked(os, true);
 			break;
 		case 0x06:		/* CYCLE_COUNT_STOP */
-			os->regs[R_GPU_STATUS / 4] &= ~(1u << 6);
+			jm_cycles_set_locked(os, false);
 			break;
 		case 0x07:		/* CLEAN_CACHES */
 		case 0x08:		/* CLEAN_INV_CACHES */
 			os->flushes++;
 			os->last_flush = v;
+			os->regs[R_LATEST_FLUSH_ID / 4]++;	/* (jm-hw) */
 			raise_later_locked(os, 2, GPU_IRQ_CLEAN_CACHES);
 			break;
 		default:
@@ -1306,7 +1461,9 @@ static bool jm_gpu_reg_write_locked(struct pw_os *os, uint32_t off, uint32_t v)
 		return true;
 	case R_SHADER_PWRON:
 	case R_TILER_PWRON:
-		os->regs[(off - 0x40) / 4] |= v;	/* *_READY is PWRON - 0x40 */
+		/* (jm-hw) power-up timeout knobs */
+		if (!(off == R_SHADER_PWRON ? os->cfg.no_shader_ready : os->cfg.no_tiler_ready))
+			os->regs[(off - 0x40) / 4] |= v;	/* *_READY is PWRON - 0x40 */
 		raise_locked(os, 2, GPU_IRQ_POWER_CHANGED_BOTH);
 		return true;
 	case R_STACK_PWRON:
@@ -1355,6 +1512,15 @@ uint32_t pw_os_reg_read32(struct pw_os *os, uint32_t off)
 	line = int_line(off, &sub);
 	if (is_jm(os) && line < 0 && off >= R_JOB_CONTROL_EXTRA && off < R_JOB_CONTROL_END &&
 	    mock_jm_reg_read_locked(os, off, &v)) {
+		pthread_mutex_unlock(&os->lock);
+		return v;
+	}
+	/* (jm-hw) G31 free-running counters */
+	if (is_jm(os) && off >= R_CYCLE_COUNT && off < R_TIMESTAMP + 8) {
+		uint64_t c = off >= R_TIMESTAMP ? mock_gpu_timestamp_locked(os) :
+						  mock_gpu_cycles_locked(os);
+
+		v = (off & 4) ? (uint32_t)(c >> 32) : (uint32_t)c;
 		pthread_mutex_unlock(&os->lock);
 		return v;
 	}
@@ -1443,6 +1609,11 @@ void pw_os_reg_write32(struct pw_os *os, uint32_t off, uint32_t v)
 			os->rawstat[line] &= ~v;
 		else if (sub == 0x8)
 			os->mask[line] = v;
+		/* (jm-hw) clears release a halted job slot / a job stalled on a page fault */
+		if (is_jm(os) && sub == 0x4 && line == 0)
+			mock_jm_int_clear_locked(os, v);
+		if (is_jm(os) && sub == 0x4 && line == 1)
+			mock_jm_mmu_clear_locked(os, v);
 		pthread_cond_broadcast(&os->cond);
 		goto out;
 	}
@@ -1627,6 +1798,13 @@ uint32_t mock_int_mask(struct pw_os *os, unsigned int line)
 	return v;
 }
 
+void mock_fail_mem_allocs(struct pw_os *os, uint32_t count)
+{
+	pthread_mutex_lock(&os->lock);
+	os->fail_mem_allocs = count;
+	pthread_mutex_unlock(&os->lock);
+}
+
 void mock_get_as(struct pw_os *os, unsigned int as, struct mock_as_state *st)
 {
 	pthread_mutex_lock(&os->lock);
@@ -1787,6 +1965,8 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 
 	pthread_mutex_init(&os->lock, NULL);
 	mono_cond_init(&os->cond);
+	if (is_jm(os))
+		mock_jm_start(os);	/* (jm-hw) job-chain executor thread */
 
 	os->regs[0x0 / 4] = os->cfg.gpu_id;
 	os->regs[0x4 / 4] = MOCK_G610_L2_FEATURES;
@@ -1822,6 +2002,7 @@ struct pw_os *mock_create(const struct mock_config *cfg)
 
 void mock_destroy(struct pw_os *os)
 {
+	mock_jm_stop(os);	/* (jm-hw) no-op unless the G31 executor runs */
 	pthread_mutex_lock(&os->lock);
 	os->dev = NULL;
 	os->running = false;

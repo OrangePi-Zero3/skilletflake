@@ -1,5 +1,8 @@
 # Installing panwin.sys on an RK3588 Windows on ARM board (test-signed)
 
+For the Orange Pi Zero3 (Mali-G31, job manager) see [`zero3.md`](zero3.md) instead; this guide
+is the RK3588 one.
+
 Status: written before any hardware run. Every step that depends on the board or on Windows
 behaviour we could not try is marked **[unverified]**. Report what actually happens in
 `docs/status/` so this guide can be corrected.
@@ -22,7 +25,9 @@ Shell> mm FB000000 -w 4 -MMIO -n     # GPU_ID, only if the above say "on": expec
 ```
 
 panwin.sys performs the same check as the edk2 patch's `GPON` method before its first GPU access
-(registry `Rk3588PmuCheck`, default 1) and refuses to touch the GPU if it fails.
+(registry `Rk3588PmuCheck`, default 1) and refuses to touch the GPU if it fails. The check only
+runs when the device's hardware ID is `RKCP7410` (kmd/win/pw_win_plat.c); a device whose ID the
+driver does not recognise is never touched.
 
 ## 1. Build the package on Linux
 
@@ -143,7 +148,8 @@ Parameters` (instance path from step 5, e.g. `ACPI\RKCP7410\0` **[unverified]**)
 | `BootFirmware` | DWORD | 0 | 0 = M1 (GPU_ID, reset, L2); 1 = load and boot the CSF firmware |
 | `FirmwareRoot` | REG_SZ | `\SystemRoot\System32\drivers\panwin\` | NT path prefix for firmware files |
 | `FirmwareName` | REG_SZ | (unset) | override `arm/mali/arch<maj>.<min>/mali_csffw.bin` |
-| `Rk3588PmuCheck` | DWORD | 1 | read PMU PD_GPU state before touching the GPU (0 = skip, risky) |
+| `Rk3588PmuCheck` | DWORD | 1 | read PMU PD_GPU state before touching the GPU (0 = skip, risky); RK3588 hardware ID only |
+| `AcpiPscCheck` | DWORD | 1 | not used on the RK3588 (its node has no `_PSC`); see zero3.md |
 
 The service key `HKLM\SYSTEM\CurrentControlSet\Services\panwin\Parameters` is used as a
 fallback. Values are read when the device starts:
@@ -191,7 +197,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filte
    `KeGetCurrentIrql`/`KfRaiseIrql` exported on ARM64?
 3. Note the KMDF version (`Wdf01000.sys` → Properties → Details) and the Windows build (`winver`).
 4. Install the `core=stub` build (BootFirmware=0). Expected log, in order: `panwin.sys 0.1.0 ...`,
-   `params: ...`, `irq 0 (job) ... irq 2 (gpu)`, `MMIO 0xfb000000+0x200000 mapped`, `PMU: ... -> GPU
+   `board: RK3588 Mali-G610 (CSF, _HID RKCP7410, ...)`, `params: ...`, `irq 0 (job) ... irq 2 (gpu)`, `MMIO 0xfb000000+0x200000 mapped`, `PMU: ... -> GPU
    on`, `CNTFRQ_EL0 = 24000000 Hz`, `core stub: GPU_ID 0xa867....`, `core device up`. Then run
    `tools/panwin-info` (GET_INFO with `abi_version 2`, DRM_IOCTL_VERSION `panthor 1.0.0`,
    DEV_QUERY GPU_INFO, then `user MMIO page: LATEST_FLUSH_ID = 0x...` - the read-only user

@@ -8,3 +8,6 @@ build*/
 *.a
 !toolchain/lib/*.def
 /out/
+/kmd/win/tests/test_glue
+/kmd/win/tests/test_plat
+/kmd/win/tests/test_stub

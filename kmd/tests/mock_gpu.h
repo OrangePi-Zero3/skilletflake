@@ -129,6 +129,9 @@ struct mock_config {
 	 * the host tests keep their 0xa5 poison everywhere; libdrm-win's core transport turns it
 	 * on because userspace (Mesa) relies on zeroed BOs, as on Linux. */
 	bool honor_zeroed;
+	/* (jm-hw) G31 only: SHADER_READY / TILER_READY never set (power-up timeout tests). */
+	bool no_shader_ready;
+	bool no_tiler_ready;
 };
 
 struct mock_as_state {
@@ -137,6 +140,10 @@ struct mock_as_state {
 	bool locked;
 	uint64_t lockaddr;
 	uint32_t updates, locks, unlocks;
+	/* (added by jm-mem) AS_COMMAND_FLUSH_PT / FLUSH_MEM seen. On the G31 model they end a
+	 * pending LOCK (the JM TLB-maintenance sequence: LOCK, update, FLUSH_PT/FLUSH_MEM); on the
+	 * G610 model they are counted and otherwise ignored. */
+	uint32_t flush_pts, flush_mems;
 };
 
 struct mock_glb_snapshot {
@@ -162,6 +169,8 @@ uint32_t mock_reg(struct pw_os *os, uint32_t offset);
 uint32_t mock_rawstat(struct pw_os *os, unsigned int line);	/* 0 job, 1 mmu, 2 gpu */
 uint32_t mock_int_mask(struct pw_os *os, unsigned int line);	/* live INT_MASK value */
 void mock_get_as(struct pw_os *os, unsigned int as, struct mock_as_state *st);
+/* (added by jm-mem) The next @count pw_os_mem_alloc() calls fail with PW_ENOMEM (0 = off). */
+void mock_fail_mem_allocs(struct pw_os *os, uint32_t count);
 uint32_t mock_flush_count(struct pw_os *os);
 uint32_t mock_last_flush_cmd(struct pw_os *os);
 uint32_t mock_soft_resets(struct pw_os *os);
@@ -178,7 +187,11 @@ uint32_t mock_mcu_glb_req(struct pw_os *os);
 uint32_t mock_mcu_glb_ack(struct pw_os *os);
 
 /* Emulated GPU MMU walk using the AS configuration latched by the last UPDATE, reading the
- * tables from "DRAM" (what the GPU sees, i.e. only flushed CPU writes).
+ * tables from "DRAM" (what the GPU sees, i.e. only flushed CPU writes). (jm-mem) Both the
+ * AArch64 4K format (TRANSCFG ADRMODE 6) and, on the G31 model, the legacy Mali LPAE format
+ * (ADRMODE_LEGACY 0 with TRANSTAB[1:0] = 3: 4 levels, leaf type 0b01 at every level, bit 6 =
+ * read, bit 7 = write, XN bit 54, no access flag) are walked; descriptors of the other format
+ * fault, so a format mix-up is visible to tests.
  * access: 'r', 'w' or 'x'. Returns 0 or a Mali exception code (0xc0+lvl translation,
  * 0xc8+lvl permission, 0xd8+lvl access flag, 0x80 bus fault). */
 int mock_gpu_translate(struct pw_os *os, unsigned int as, uint64_t va, char access, uint64_t *pa,
@@ -238,23 +251,63 @@ void mock_csf_inject_tiler_oom(struct pw_os *os, uint32_t count, uint32_t vt_sta
 uint32_t mock_csf_oom_handled(struct pw_os *os, uint64_t *heap_start, uint64_t *heap_end);
 
 /*
- * (jm-arch) Job-manager executor (mock_jm.c, G31 model only). PLACEHOLDER: the register
- * hooks exist, the executor does not yet (owner: jm-hw, docs/status/jm-arch.md). Intended
- * model: JS_COMMAND_NEXT = START latches HEAD/AFFINITY/CONFIG_NEXT into the slot; the job chain
- * at HEAD is walked through the AS in CONFIG (Mesa genxml v7.xml job header: type, next, and
- * for WRITE_VALUE/NULL/CACHE_FLUSH their payloads; other job types complete without executing
- * shaders), then JOB_INT DONE(js) or ERR(js) with JS_STATUS set; SOFT/HARD_STOP honoured,
- * JS_STATE tracked; GPU faults raise MMU faults like the CSF executor.
+ * (jm-arch, jm-hw) Job-manager executor (mock_jm.c, G31 model only; the full model is in the
+ * header of mock_jm.c). JS_COMMAND_NEXT = START latches HEAD/AFFINITY/CONFIG/FLUSH_ID_NEXT; the
+ * chain moves to the current slot when it is idle and no ERR of the slot is pending; an
+ * executor thread walks it through the AS in JS_CONFIG (Mesa genxml v7.xml Job Header:
+ * WRITE_VALUE executed, NULL/CACHE_FLUSH and the shader job types completed without shaders,
+ * exception status DONE written back), then JOB_INT DONE(js), or ERR(js) with JS_STATUS on a
+ * fault/stop. GPU page faults raise an MMU fault on the AS and stall the job until the fault
+ * is cleared with the page mapped (retry) or the AS disabled (job fails).
  */
 struct mock_js_stats {
 	uint32_t starts;		/* JS_COMMAND_NEXT = START latched */
-	uint32_t done, failed, stopped;
+	uint32_t done, failed, stopped;	/* DONE IRQs, faults/injected failures, soft stops */
 	uint64_t last_head;		/* HEAD of the last started chain */
 	uint32_t last_config;		/* CONFIG of the last started chain */
 	uint32_t last_status;		/* JS_STATUS after it */
-	uint64_t jobs;			/* job descriptors walked */
+	uint64_t jobs;			/* job descriptors completed */
+	/* (jm-hw) */
+	uint32_t runs;			/* chains that moved from NEXT to current */
+	uint32_t terminated;		/* hard stops */
+	uint32_t ignored_stops;		/* stop commands that matched no running chain */
+	uint32_t next_cancels;		/* JS_COMMAND_NEXT = NOP that dropped a queued chain */
+	uint64_t last_affinity;		/* AFFINITY of the last started chain */
+	uint32_t last_flush_id;		/* FLUSH_ID of the last started chain */
+	uint64_t last_tail;		/* JS_TAIL when the last chain ended */
+	uint32_t null_jobs, write_values, cache_flushes, noop_jobs;	/* by job type */
+	uint32_t page_faults, fault_retries, config_faults, dep_violations;
+	uint64_t last_fault_va;
+	uint32_t start_flushes, start_flushes_skipped, end_flushes;	/* JS_CONFIG bookkeeping */
+	uint32_t resets;		/* GPU resets seen */
+	/* live state */
+	bool running, next_valid, mmu_stalled, hung, stalled, err_pending;
 };
 void mock_jm_js_stats(struct pw_os *os, unsigned int js, struct mock_js_stats *st);
+
+/* (jm-hw) Fault injection for the next @count chains that start on @js (0 = every chain until
+ * changed; MOCK_JM_INJ_NONE clears): HANG never completes and ignores soft stops (hard stop or
+ * reset ends it), STALL waits for mock_jm_kick() and then runs normally (soft stops work),
+ * FAIL ends the chain at its first job with JS_STATUS = @status (header status written). */
+enum mock_jm_inject {
+	MOCK_JM_INJ_NONE = 0,
+	MOCK_JM_INJ_HANG,
+	MOCK_JM_INJ_STALL,
+	MOCK_JM_INJ_FAIL,
+};
+void mock_jm_inject(struct pw_os *os, unsigned int js, enum mock_jm_inject what, uint32_t status,
+		    uint32_t count);
+void mock_jm_kick(struct pw_os *os, unsigned int js);	/* release a STALLed chain */
+
+/* (jm-hw) The last jobs that ended on @js, oldest first (ring of 64): completed ones with their
+ * type/index and status DONE; for a failed chain one record with type 0xff and the status. */
+struct mock_jm_job_rec {
+	uint64_t va;
+	uint32_t type, index, status;
+};
+unsigned int mock_jm_job_log(struct pw_os *os, unsigned int js, struct mock_jm_job_rec *recs,
+			     unsigned int max);
+void mock_jm_job_log_clear(struct pw_os *os, unsigned int js);
 
 /* Logging captured from pw_os_log (all levels). */
 bool mock_log_contains(struct pw_os *os, const char *needle);

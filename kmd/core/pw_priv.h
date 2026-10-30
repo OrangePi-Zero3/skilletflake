@@ -64,6 +64,10 @@ struct pw_mmu {
 	uint32_t pa_bits;
 	uint64_t memattr;		/* AS_MEMATTR for every VM (derived from our MAIR) */
 	bool ready;
+	/* (added by jm-mem) Format requested with pw_device_set_pt_format() for VMs created
+	 * from now on; only honoured on JM (pw_vm_create). Zero-initialised = AArch64. The
+	 * AArch64 VMs use @memattr above, Mali LPAE ones PW_LPAE_MEMATTR (pw_vm_memattr()). */
+	enum pw_pt_format pt_format;
 };
 
 /* ---- firmware ---- */

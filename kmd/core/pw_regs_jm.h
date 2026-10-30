@@ -35,6 +35,15 @@
 #define GPU_TILER_CONFIG			0xF08
 #define GPU_L2_MMU_CONFIG			0xF0C
 
+/* (jm-hw) Bits of the quirk registers that the Bifrost rules in pw_jm_hw.c set (meanings from
+ * the Mali register map; panfrost_regs.h read for cross-checking only). */
+#define   SC_TLS_HASH_ENABLE			PW_BIT(17)	/* SHADER_CONFIG */
+#define   SC_VAR_ALGORITHM			PW_BIT(29)
+#define   TC_CLOCK_GATE_OVERRIDE		PW_BIT(0)	/* TILER_CONFIG */
+#define   JM_FORCE_COHERENCY_FEATURES_SHIFT	2		/* JM_CONFIG */
+#define   JM_IDVS_GROUP_SIZE_SHIFT		16
+#define   JM_DEFAULT_IDVS_GROUP_SIZE		0xFu
+
 /* GPU_INT bits that only exist on JM (the rest are in pw_regs_gpu.h). Bit 1 (CSF
  * PROTM_FAULT) and bits 18-19 (CSF doorbell mirror, MCU status) are not used on JM. */
 #define   GPU_IRQ_MULTIPLE_FAULT		PW_BIT(7)
@@ -56,12 +65,16 @@
 
 /* ---- JOB_CONTROL ---- */
 #define JOB_CONTROL_BASE			0x1000
-#define JOB_INT_JS_STATE			0x1010	/* bit n: slot n has an active job */
+/* bit n: slot n has an active (current) job; bit n + 16: slot n has a job waiting in the NEXT
+ * registers. Sampled for a slot's bits when JOB_INT_CLEAR is written for that slot. */
+#define JOB_INT_JS_STATE			0x1010
 #define JOB_INT_THROTTLE			0x1014
 /* JOB_INT bits [15:0] = job chain done on slot n, [31:16] = job chain failed on slot n. */
 #define   JOB_INT_DONE(js)			PW_BIT(js)
 #define   JOB_INT_ERR(js)			PW_BIT((js) + 16)
 #define   JOB_INT_SLOT_MASK(js)			(JOB_INT_DONE(js) | JOB_INT_ERR(js))
+/* (jm-hw) JS_STATE bits of slot js (current + NEXT): the same positions as its JOB_INT bits. */
+#define   JOB_JS_STATE_SLOT_MASK(js)		JOB_INT_SLOT_MASK(js)
 
 #define PW_JM_MAX_HW_SLOTS			16	/* register space; JS_PRESENT says which exist */
 

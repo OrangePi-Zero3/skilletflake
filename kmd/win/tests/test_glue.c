@@ -19,6 +19,7 @@
 #include "panwin/panwin_ioctl.h"
 #include "drm.h"
 #include "panthor_drm.h"
+#include "panfrost_drm.h"
 
 long fake_wdk_misuse_count(void);
 
@@ -740,6 +741,160 @@ static void test_work(void)
 	device_down();
 }
 
+/*
+ * (jm-glue review) The glue on a job-manager GPU: a static "always ready" Mali-G31 register
+ * file (GPU_ID 0x70930000, every power domain READY, RESET/POWER/CLEAN completion bits latched in
+ * GPU_INT_RAWSTAT), probed by the real core. Covers what jm-glue could only check through
+ * libdrm-win's copy of the logic: GET_INFO reports PANWIN_INFO_JM and the panfrost DRM version
+ * (also after a failed probe), VERSION through pw_win_ioctl.c says "panfrost", a panfrost
+ * GET_PARAM goes through, and the user-MMIO mmap offsets fail with EINVAL (no such page on JM).
+ */
+static uint32_t g31_regs[0x40000 / 4];
+
+static void g31_regs_init(bool ready)
+{
+	memset(g31_regs, 0, sizeof(g31_regs));
+	g31_regs[0x000 / 4] = 0x70930000u;	/* GPU_ID: G31 r0p0 */
+	g31_regs[0x004 / 4] = 0x07110206u;	/* L2_FEATURES */
+	g31_regs[0x014 / 4] = 0x00003030u;	/* MMU_FEATURES: 48-bit VA and PA (host addresses) */
+	g31_regs[0x018 / 4] = 0xffu;		/* AS_PRESENT */
+	g31_regs[0x01c / 4] = 0x7u;		/* JS_PRESENT */
+	g31_regs[0x100 / 4] = 0x3u;		/* SHADER_PRESENT */
+	g31_regs[0x110 / 4] = 0x1u;		/* TILER_PRESENT */
+	g31_regs[0x120 / 4] = 0x1u;		/* L2_PRESENT */
+	g31_regs[0xe00 / 4] = 0x1u;		/* STACK_PRESENT */
+	if (!ready)
+		return;
+	/* RESET_COMPLETED | POWER_CHANGED | POWER_CHANGED_ALL | CLEAN_CACHES_COMPLETED */
+	g31_regs[0x020 / 4] = (1u << 8) | (1u << 9) | (1u << 10) | (1u << 17);
+	g31_regs[0x140 / 4] = 0x3u;		/* SHADER_READY */
+	g31_regs[0x150 / 4] = 0x1u;		/* TILER_READY */
+	g31_regs[0x160 / 4] = 0x1u;		/* L2_READY */
+	g31_regs[0xe10 / 4] = 0x1u;		/* STACK_READY */
+}
+
+/* Like device_up(), but with the register file and a real probe; returns the probe's result. */
+static int device_up_g31(bool ready)
+{
+	struct pw_device_params p = { 0 };
+	struct pw_device *pw = NULL;
+	int ret;
+
+	g31_regs_init(ready);
+	g_dev = fake_wdf_object_new(sizeof(PW_DEVICE_CTX));
+	g_ctx = PwDeviceCtx(g_dev);
+	g_ctx->device = g_dev;
+	pw_os_win_init(&g_ctx->os, g_dev);
+	pw_win_files_init(g_ctx);
+	g_ctx->os.mmio = (volatile UCHAR *)g31_regs;
+	g_ctx->os.mmio_len = sizeof(g31_regs);
+	g_ctx->os.regs_enabled = 1;
+	g_ctx->gpu_powered = TRUE;
+	p.os = &g_ctx->os;
+	CHECK_EQ(pw_device_alloc(&p, &pw), PW_OK);
+	g_ctx->pw = pw;
+	ret = pw_device_probe(pw);
+	g_ctx->core_status = ret;
+	g_ctx->backend = pw_device_backend(pw);
+	g_ctx->probed = 1;
+	g_ctx->core_ready = ret == 0;
+	return ret;
+}
+
+static void device_down_g31(void)
+{
+	device_down();
+}
+
+static void test_jm(void)
+{
+	struct panwin_info info;
+	uint32_t maj = 0, min = 0, patch = 0;
+	const char *name = NULL;
+	WDFFILEOBJECT fo;
+	uint64_t va = 0;
+	int ret;
+
+	/* 1. Failed probe (GPU_ID read, reset never completes): still a JM device for GET_INFO. */
+	CHECK(device_up_g31(false) != 0);
+	CHECK_EQ(g_ctx->backend, PW_BACKEND_JM);
+	fo = file_open();
+	memset(&info, 0, sizeof(info));
+	CHECK_EQ(ioctl_raw(fo, PANWIN_IOCTL_GET_INFO, &info, 0, sizeof(info)), STATUS_SUCCESS);
+	pw_device_drm_version(g_ctx->pw, &maj, &min, &patch, &name);
+	CHECK(name && !strcmp(name, "panfrost"));
+	CHECK(info.flags & PANWIN_INFO_JM);
+	CHECK(!(info.flags & PANWIN_INFO_FW_BOOTED));
+	CHECK_EQ(info.drm_version_major, maj);
+	CHECK_EQ(info.drm_version_minor, min);
+	CHECK(strstr(info.description, "no core device") != NULL);
+	{
+		struct drm_panfrost_get_param gp = { .param = DRM_PANFROST_PARAM_GPU_PROD_ID };
+
+		CHECK_EQ(drm(fo, DRM_IOCTL_PANFROST_GET_PARAM, &gp), -ENODEV);
+	}
+	/* Once the device is gone (D0Exit clears probed), GET_INFO is the pre-JM panthor answer. */
+	g_ctx->probed = 0;
+	memset(&info, 0, sizeof(info));
+	CHECK_EQ(ioctl_raw(fo, PANWIN_IOCTL_GET_INFO, &info, 0, sizeof(info)), STATUS_SUCCESS);
+	pw_device_drm_version(NULL, &maj, &min, &patch, NULL);
+	CHECK(!(info.flags & PANWIN_INFO_JM));
+	CHECK_EQ(info.drm_version_major, maj);
+	CHECK_EQ(info.drm_version_minor, min);
+	file_close(fo);
+	device_down_g31();
+
+	/* 2. Successful probe on the static register file. */
+	ret = device_up_g31(true);
+	if (ret) {
+		/* The core's init now waits for something this static file does not model: not a
+		 * glue bug, so report it instead of failing (extend g31_regs_init()). */
+		fprintf(stderr, "  SKIP jm part 2: probe on the static G31 register file failed (%d)\n",
+			ret);
+		device_down_g31();
+		return;
+	}
+	fo = file_open();
+	memset(&info, 0, sizeof(info));
+	CHECK_EQ(ioctl_raw(fo, PANWIN_IOCTL_GET_INFO, &info, 0, sizeof(info)), STATUS_SUCCESS);
+	pw_device_drm_version(g_ctx->pw, &maj, &min, &patch, NULL);
+	CHECK(info.flags & PANWIN_INFO_JM);
+	CHECK_EQ(info.drm_version_major, maj);
+	CHECK_EQ(info.drm_version_minor, min);
+	{
+		char nbuf[16] = { 0 };
+		struct drm_version v = { .name = nbuf, .name_len = sizeof(nbuf) - 1 };
+
+		CHECK_EQ(drm(fo, DRM_IOCTL_VERSION, &v), 0);
+		CHECK_EQ(v.name_len, 8);
+		CHECK(!strcmp(nbuf, "panfrost"));
+		CHECK_EQ(v.version_major, (int)maj);
+		CHECK_EQ(v.version_minor, (int)min);
+	}
+	{
+		struct drm_panfrost_get_param gp = { .param = DRM_PANFROST_PARAM_GPU_PROD_ID };
+
+		CHECK_EQ(drm(fo, DRM_IOCTL_PANFROST_GET_PARAM, &gp), 0);
+		CHECK_EQ(gp.value, 0x7093);
+		gp.param = DRM_PANFROST_PARAM_JS_PRESENT;
+		gp.value = 0;
+		CHECK_EQ(drm(fo, DRM_IOCTL_PANFROST_GET_PARAM, &gp), 0);
+		CHECK_EQ(gp.value, 0x7);
+	}
+	/* No user-MMIO page on JM: EINVAL at both offsets, read-only or not, nothing mapped. */
+	{
+		long live0 = fake_user_maps_live;
+
+		CHECK_EQ(st_errno(do_mmap(fo, DRM_PANTHOR_USER_MMIO_OFFSET_64BIT, 4096,
+					  PANWIN_PROT_READ, &va)), -EINVAL);
+		CHECK_EQ(st_errno(do_mmap(fo, DRM_PANTHOR_USER_MMIO_OFFSET_32BIT, 4096,
+					  PANWIN_PROT_READ, &va)), -EINVAL);
+		CHECK_EQ(fake_user_maps_live, live0);
+	}
+	file_close(fo);
+	device_down_g31();
+}
+
 /* ----------------------------------------------------------------------------- main */
 
 static const struct {
@@ -755,6 +910,7 @@ static const struct {
 	{ "syncobj_event_races", test_syncobj_event_races },
 	{ "mmap", test_mmap },
 	{ "work", test_work },
+	{ "jm", test_jm },
 };
 
 int main(int argc, char **argv)

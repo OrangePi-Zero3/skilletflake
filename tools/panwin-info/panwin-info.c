@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * panwin-info: bring-up tool for panwin.sys. Opens a device through libdrm-win and prints
- * PANWIN_IOCTL_GET_INFO, drmGetVersion, DEV_QUERY GPU_INFO / CSIF_INFO (decoded), the user MMIO
- * page (LATEST_FLUSH_ID, through PANWIN_IOCTL_MMAP: exercises the kernel's read-only MMIO
- * mapping path), and optional raw register reads (PANWIN_IOCTL_DEBUG_REG_READ, debug builds of
- * panwin.sys only). Opens with PANWIN_O_NOABICHECK so a driver/DLL ABI mismatch is reported
- * instead of failing the open.
+ * PANWIN_IOCTL_GET_INFO, drmGetVersion, then per uAPI:
+ *  - "panthor" (CSF, RK3588 G610): DEV_QUERY GPU_INFO / CSIF_INFO (decoded) and the user MMIO
+ *    page (LATEST_FLUSH_ID, through PANWIN_IOCTL_MMAP: exercises the kernel's read-only MMIO
+ *    mapping path);
+ *  - "panfrost" (job manager, H616 G31): every DRM_PANFROST_PARAM_* value (the Z1 register dump,
+ *    docs/bringup/zero3.md), a summary in the layout of Linux panfrost's boot messages, and the
+ *    check that the user-MMIO offset is refused (EINVAL: panfrost has no such page);
+ * and optional raw register reads (PANWIN_IOCTL_DEBUG_REG_READ, debug builds of panwin.sys
+ * only). Opens with PANWIN_O_NOABICHECK so a driver/DLL ABI mismatch is reported instead of
+ * failing the open.
  *
  *   panwin-info [--device N] [--reg OFFSET]... [--fake] [--transport NAME] [--list]
  */
@@ -17,6 +22,7 @@
 
 #include <xf86drm.h>
 #include <panthor_drm.h>
+#include <panfrost_drm.h>
 #include <panwin/panwin_ioctl.h>
 #include <libdrm_win.h>
 
@@ -34,6 +40,9 @@ static const char *product_name(uint32_t gpu_id)
 {
 	/* (arch_major, arch_minor, product_major) -> name, from Mesa's pan_model.c (MIT). */
 	static const struct { unsigned maj, min, prod; const char *name; } t[] = {
+		{ 6, 0, 0, "Mali-G71" }, { 6, 2, 1, "Mali-G72" }, { 7, 0, 0, "Mali-G51" },
+		{ 7, 0, 3, "Mali-G31" }, { 7, 2, 1, "Mali-G76" }, { 7, 2, 2, "Mali-G52" },
+		{ 7, 4, 2, "Mali-G52 r1" },
 		{ 9, 0, 1, "Mali-G57" }, { 9, 0, 3, "Mali-G57" }, { 9, 2, 4, "Mali-G68" },
 		{ 10, 8, 7, "Mali-G610" }, { 10, 12, 4, "Mali-G310" }, { 11, 8, 2, "Mali-G715" },
 		{ 11, 8, 3, "Mali-G615" }, { 12, 8, 0, "Mali-G720" }, { 13, 8, 0, "Mali-G725" },
@@ -106,11 +115,120 @@ static void print_gpu_info(const struct drm_panthor_gpu_info *g)
 	printf("  gpu_features      0x%016" PRIx64 "\n", g->gpu_features);
 }
 
+/* ---- panfrost (job manager) ---- */
+
+static const char *const panfrost_param_names[] = {
+	[DRM_PANFROST_PARAM_GPU_PROD_ID] = "GPU_PROD_ID",
+	[DRM_PANFROST_PARAM_GPU_REVISION] = "GPU_REVISION",
+	[DRM_PANFROST_PARAM_SHADER_PRESENT] = "SHADER_PRESENT",
+	[DRM_PANFROST_PARAM_TILER_PRESENT] = "TILER_PRESENT",
+	[DRM_PANFROST_PARAM_L2_PRESENT] = "L2_PRESENT",
+	[DRM_PANFROST_PARAM_STACK_PRESENT] = "STACK_PRESENT",
+	[DRM_PANFROST_PARAM_AS_PRESENT] = "AS_PRESENT",
+	[DRM_PANFROST_PARAM_JS_PRESENT] = "JS_PRESENT",
+	[DRM_PANFROST_PARAM_L2_FEATURES] = "L2_FEATURES",
+	[DRM_PANFROST_PARAM_CORE_FEATURES] = "CORE_FEATURES",
+	[DRM_PANFROST_PARAM_TILER_FEATURES] = "TILER_FEATURES",
+	[DRM_PANFROST_PARAM_MEM_FEATURES] = "MEM_FEATURES",
+	[DRM_PANFROST_PARAM_MMU_FEATURES] = "MMU_FEATURES",
+	[DRM_PANFROST_PARAM_THREAD_FEATURES] = "THREAD_FEATURES",
+	[DRM_PANFROST_PARAM_MAX_THREADS] = "MAX_THREADS",
+	[DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ] = "THREAD_MAX_WORKGROUP_SZ",
+	[DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ] = "THREAD_MAX_BARRIER_SZ",
+	[DRM_PANFROST_PARAM_COHERENCY_FEATURES] = "COHERENCY_FEATURES",
+	[DRM_PANFROST_PARAM_TEXTURE_FEATURES0] = "TEXTURE_FEATURES0",
+	[DRM_PANFROST_PARAM_TEXTURE_FEATURES1] = "TEXTURE_FEATURES1",
+	[DRM_PANFROST_PARAM_TEXTURE_FEATURES2] = "TEXTURE_FEATURES2",
+	[DRM_PANFROST_PARAM_TEXTURE_FEATURES3] = "TEXTURE_FEATURES3",
+	[DRM_PANFROST_PARAM_JS_FEATURES0] = "JS_FEATURES0",
+	[DRM_PANFROST_PARAM_JS_FEATURES1] = "JS_FEATURES1",
+	[DRM_PANFROST_PARAM_JS_FEATURES2] = "JS_FEATURES2",
+	[DRM_PANFROST_PARAM_JS_FEATURES3] = "JS_FEATURES3",
+	[DRM_PANFROST_PARAM_JS_FEATURES4] = "JS_FEATURES4",
+	[DRM_PANFROST_PARAM_JS_FEATURES5] = "JS_FEATURES5",
+	[DRM_PANFROST_PARAM_JS_FEATURES6] = "JS_FEATURES6",
+	[DRM_PANFROST_PARAM_JS_FEATURES7] = "JS_FEATURES7",
+	[DRM_PANFROST_PARAM_JS_FEATURES8] = "JS_FEATURES8",
+	[DRM_PANFROST_PARAM_JS_FEATURES9] = "JS_FEATURES9",
+	[DRM_PANFROST_PARAM_JS_FEATURES10] = "JS_FEATURES10",
+	[DRM_PANFROST_PARAM_JS_FEATURES11] = "JS_FEATURES11",
+	[DRM_PANFROST_PARAM_JS_FEATURES12] = "JS_FEATURES12",
+	[DRM_PANFROST_PARAM_JS_FEATURES13] = "JS_FEATURES13",
+	[DRM_PANFROST_PARAM_JS_FEATURES14] = "JS_FEATURES14",
+	[DRM_PANFROST_PARAM_JS_FEATURES15] = "JS_FEATURES15",
+	[DRM_PANFROST_PARAM_NR_CORE_GROUPS] = "NR_CORE_GROUPS",
+	[DRM_PANFROST_PARAM_THREAD_TLS_ALLOC] = "THREAD_TLS_ALLOC",
+	[DRM_PANFROST_PARAM_AFBC_FEATURES] = "AFBC_FEATURES",
+	[DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP] = "SYSTEM_TIMESTAMP",
+	[DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY] = "SYSTEM_TIMESTAMP_FREQUENCY",
+	[DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES] = "ALLOWED_JM_CTX_PRIORITIES",
+	[DRM_PANFROST_PARAM_SELECTED_COHERENCY] = "SELECTED_COHERENCY",
+};
+#define PANFROST_NPARAMS (sizeof(panfrost_param_names) / sizeof(panfrost_param_names[0]))
+
+/* Every DRM_PANFROST_PARAM_*, as Mesa's panfrost_kmod.c queries them. Returns 0 if all answered. */
+static int print_panfrost_params(int fd)
+{
+	uint64_t val[PANFROST_NPARAMS];
+	int err[PANFROST_NPARAMS], nfail = 0;
+
+	printf("GET_PARAM (DRM_IOCTL_PANFROST_GET_PARAM, all %u params):\n", (unsigned)PANFROST_NPARAMS);
+	for (uint32_t p = 0; p < PANFROST_NPARAMS; p++) {
+		struct drm_panfrost_get_param gp = { .param = p };
+
+		err[p] = drmIoctl(fd, DRM_IOCTL_PANFROST_GET_PARAM, &gp) ? errno : 0;
+		val[p] = gp.value;
+		if (err[p]) {
+			nfail++;
+			printf("  %2u %-27s failed: %s\n", p, panfrost_param_names[p], err_str(err[p]));
+		} else {
+			printf("  %2u %-27s 0x%016" PRIx64 "  %" PRIu64 "\n", p, panfrost_param_names[p],
+			       val[p], val[p]);
+		}
+	}
+	if (err[DRM_PANFROST_PARAM_GPU_PROD_ID] || err[DRM_PANFROST_PARAM_GPU_REVISION])
+		return nfail;
+
+	/* The same facts in the layout of Linux panfrost's probe messages (compare with a Linux
+	 * boot log of the same board, and with the "to confirm" table in docs/status/jm-arch.md). */
+	uint32_t id = (uint32_t)(val[DRM_PANFROST_PARAM_GPU_PROD_ID] << 16) |
+		      (uint32_t)(val[DRM_PANFROST_PARAM_GPU_REVISION] & 0xffff);
+	printf("summary:\n");
+	printf("  %s id 0x%04" PRIx64 " major 0x%x minor 0x%x status 0x%x (GPU_ID 0x%08" PRIx32
+	       ", arch %u.%u.%u)\n", product_name(id), val[DRM_PANFROST_PARAM_GPU_PROD_ID],
+	       (id >> 12) & 0xf, (id >> 4) & 0xff, id & 0xf, id, id >> 28, (id >> 24) & 0xf,
+	       (id >> 20) & 0xf);
+	printf("  Features: L2:0x%08" PRIx64 " Shader:0x%08" PRIx64 " Tiler:0x%08" PRIx64
+	       " Mem:0x%" PRIx64 " MMU:0x%08" PRIx64 " AS:0x%" PRIx64 " JS:0x%" PRIx64 "\n",
+	       val[DRM_PANFROST_PARAM_L2_FEATURES], val[DRM_PANFROST_PARAM_CORE_FEATURES],
+	       val[DRM_PANFROST_PARAM_TILER_FEATURES], val[DRM_PANFROST_PARAM_MEM_FEATURES],
+	       val[DRM_PANFROST_PARAM_MMU_FEATURES], val[DRM_PANFROST_PARAM_AS_PRESENT],
+	       val[DRM_PANFROST_PARAM_JS_PRESENT]);
+	printf("  shader_present=0x%" PRIx64 " l2_present=0x%" PRIx64 " (%d cores, %d L2)\n",
+	       val[DRM_PANFROST_PARAM_SHADER_PRESENT], val[DRM_PANFROST_PARAM_L2_PRESENT],
+	       popcount64(val[DRM_PANFROST_PARAM_SHADER_PRESENT]),
+	       popcount64(val[DRM_PANFROST_PARAM_L2_PRESENT]));
+	printf("  MMU: VA %u bits, PA %u bits; threads max %" PRIu64 ", workgroup %" PRIu64
+	       ", barrier %" PRIu64 ", TLS alloc %" PRIu64 "\n",
+	       (unsigned)(val[DRM_PANFROST_PARAM_MMU_FEATURES] & 0xff),
+	       (unsigned)((val[DRM_PANFROST_PARAM_MMU_FEATURES] >> 8) & 0xff),
+	       val[DRM_PANFROST_PARAM_MAX_THREADS], val[DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ],
+	       val[DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ], val[DRM_PANFROST_PARAM_THREAD_TLS_ALLOC]);
+	printf("  coherency: features 0x%" PRIx64 ", selected %s (%" PRIu64 "); timestamp %" PRIu64
+	       " Hz\n", val[DRM_PANFROST_PARAM_COHERENCY_FEATURES],
+	       val[DRM_PANFROST_PARAM_SELECTED_COHERENCY] == DRM_PANFROST_GPU_COHERENCY_NONE ? "none" :
+	       val[DRM_PANFROST_PARAM_SELECTED_COHERENCY] == DRM_PANFROST_GPU_COHERENCY_ACE_LITE ?
+	       "ACE-Lite" : "?", val[DRM_PANFROST_PARAM_SELECTED_COHERENCY],
+	       val[DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY]);
+	return nfail;
+}
+
 static void usage(const char *argv0)
 {
 	printf("usage: %s [--device N] [--reg OFFSET]... [--fake] [--transport NAME] [--list]\n"
 	       "  --device N    open /dev/dri/renderD(128+N) (default 0)\n"
 	       "  --reg OFFSET  read a GPU register (hex or decimal; debug panwin.sys builds only)\n"
+	       "                e.g. 0x0 GPU_ID, 0x1c JS_PRESENT (job manager) / CSF_ID (CSF)\n"
 	       "  --fake        use libdrm-win's in-process fake kernel (needs -Dfake_kernel=true)\n"
 	       "  --transport NAME  libdrm-win transport: real, fake, a registered name, dll:<path>\n"
 	       "  --list        only list devices\n", argv0);
@@ -156,8 +274,9 @@ int main(int argc, char **argv)
 	for (int i = 0; i < n; i++) {
 		char path[512] = "?";
 		panwin_device_path(i, path, sizeof(path));
-		printf("  [%d] %s  bus=platform %s  win32=%s\n", i, devs[i]->nodes[DRM_NODE_RENDER],
-		       devs[i]->businfo.platform->fullname, path);
+		printf("  [%d] %s  bus=platform %s (%s)  win32=%s\n", i,
+		       devs[i]->nodes[DRM_NODE_RENDER], devs[i]->businfo.platform->fullname,
+		       devs[i]->deviceinfo.platform->compatible[0], path);
 	}
 	drmFreeDevices(devs, n);
 	if (list_only)
@@ -182,14 +301,17 @@ int main(int argc, char **argv)
 		rc = 1;
 	} else {
 		info.description[sizeof(info.description) - 1] = '\0';
-		printf("GET_INFO:\n  abi_version %u%s, flags 0x%x%s%s, emulated DRM %u.%u, MMIO base 0x%" PRIx64 "\n"
+		printf("GET_INFO:\n  abi_version %u%s, flags 0x%x%s%s%s, emulated DRM %u.%u, MMIO base 0x%" PRIx64 "\n"
 		       "  \"%s\"\n", info.abi_version,
 		       info.abi_version == PANWIN_ABI_VERSION ? "" : " (MISMATCH with this build!)", info.flags,
 		       (info.flags & PANWIN_INFO_FW_BOOTED) ? " fw-booted" : "",
-		       (info.flags & PANWIN_INFO_DEBUG_BUILD) ? " debug-build" : "", info.drm_version_major,
+		       (info.flags & PANWIN_INFO_DEBUG_BUILD) ? " debug-build" : "",
+		       (info.flags & PANWIN_INFO_JM) ? " job-manager" : "", info.drm_version_major,
 		       info.drm_version_minor, info.gpu_phys_base, info.description);
 	}
 
+	/* The uAPI is whatever VERSION says (as for Mesa); without it, trust GET_INFO's JM flag. */
+	int panfrost = (info.flags & PANWIN_INFO_JM) != 0;
 	drmVersionPtr v = drmGetVersion(fd);
 	if (!v) {
 		printf("drmGetVersion: failed: %s\n", err_str(errno));
@@ -197,14 +319,36 @@ int main(int argc, char **argv)
 	} else {
 		printf("drmGetVersion: %s %d.%d.%d (%s) \"%s\"\n", v->name, v->version_major,
 		       v->version_minor, v->version_patchlevel, v->date, v->desc);
+		panfrost = !strcmp(v->name, "panfrost");
 		drmFreeVersion(v);
 	}
 
 	uint64_t cap = 0;
 	if (drmGetCap(fd, DRM_CAP_SYNCOBJ_TIMELINE, &cap) == 0)
-		printf("DRM_CAP_SYNCOBJ_TIMELINE: %" PRIu64 "%s\n", cap, cap ? "" : " (panvk on CSF needs 1)");
+		printf("DRM_CAP_SYNCOBJ_TIMELINE: %" PRIu64 "%s\n", cap,
+		       cap ? "" : panfrost ? " (as Linux panfrost: Mesa emulates timelines)" :
+		       " (panvk on CSF needs 1)");
 	else
 		printf("DRM_CAP_SYNCOBJ_TIMELINE: failed: %s\n", err_str(errno));
+
+	if (panfrost) {
+		if (print_panfrost_params(fd))
+			rc = 1;
+		/* panfrost has no user-MMIO page: the kernel must refuse panthor's offset. */
+		errno = 0;
+		void *mmio = panwin_mmap(fd, DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET, 4096, 1);
+		if (mmio) {
+			printf("user MMIO page: mapped at %p, but panfrost has none: KERNEL BUG\n", mmio);
+			panwin_munmap(mmio, 4096);
+			rc = 1;
+		} else {
+			printf("user MMIO page: none on panfrost (mmap refused: %s%s)\n", err_str(errno),
+			       errno == EINVAL ? "" : ", expected EINVAL");
+			if (errno != EINVAL)
+				rc = 1;
+		}
+		goto regs;
+	}
 
 	struct drm_panthor_gpu_info gpu;
 	memset(&gpu, 0, sizeof(gpu));
@@ -238,6 +382,7 @@ int main(int argc, char **argv)
 		panwin_munmap((void *)flush, 4096);
 	}
 
+regs:
 	for (int i = 0; i < nregs; i++) {
 		struct panwin_debug_reg_read rr = { .offset = regs[i] };
 		if (panwin_private_ioctl(fd, PANWIN_IOCTL_DEBUG_REG_READ, &rr, sizeof(rr))) {
