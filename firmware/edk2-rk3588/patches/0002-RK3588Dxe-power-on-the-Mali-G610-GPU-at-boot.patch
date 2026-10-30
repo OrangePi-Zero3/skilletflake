@@ -1,0 +1,677 @@
+From f7b6147767b826ede6dc8136e1e9bdb26c9c32a3 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:09:32 +0000
+Subject: [PATCH 2/3] RK3588Dxe: power on the Mali-G610 GPU at boot
+
+Windows has no Rockchip power-domain driver, and TF-A only powers PD_GPU
+around system suspend, so GPU registers would raise an SError when read.
+Add a "GPU" setup page (GpuState, default enabled) and, when enabled:
+
+1. set clk_gpu to 200 MHz via SCMI (direct CRU fallback: GPLL/6),
+2. ungate the GPU clocks in CRU CLKGATE_CON66/67 and release the GPU
+   resets in SOFTRST_CON66/67,
+3. power on PD_GPU (PMU2 PWR_GATE_SFTCON0 bit0) and wait for the memory
+   repair status (BISR_STATUS4 bit1),
+4. release the GPU NIU idle request (BUS_IDLE_SFTCON0 bit0) and wait for
+   ACK/status to clear,
+5. log GPU_ID.
+
+The sequence runs only once vdd_gpu_s0 has been configured by
+Rk806Configure() and the setup variables are applied, whichever comes
+last. AcpiPlatformDxe sets \_SB.GPU0._STA to 0 when the GPU is disabled.
+
+Register meaning cross-checked against TF-A (BSD-3-Clause) pmu.c and
+rk3588_clk.c. Untested on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Drivers/AcpiPlatformDxe/AcpiPlatformDxe.c |   2 +
+ .../AcpiPlatformDxe/AcpiPlatformDxe.inf       |   1 +
+ .../Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.c   | 374 ++++++++++++++++++
+ .../Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.h   |  42 ++
+ .../RK3588/Drivers/RK3588Dxe/RK3588Dxe.c      |   6 +
+ .../RK3588/Drivers/RK3588Dxe/RK3588Dxe.inf    |   3 +
+ .../RK3588/Drivers/RK3588Dxe/RK3588DxeHii.uni |  10 +
+ .../RK3588/Drivers/RK3588Dxe/RK3588DxeHii.vfr |  25 ++
+ .../Rockchip/RK3588/Include/VarStoreData.h    |   6 +
+ .../Silicon/Rockchip/RK3588/RK3588.dec        |   2 +
+ .../Rockchip/RK3588/RK3588Base.dsc.inc        |   7 +
+ 11 files changed, 478 insertions(+)
+ create mode 100644 edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.c
+ create mode 100644 edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.h
+
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.c b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.c
+index c7bd633..6a88e94 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.c
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.c
+@@ -130,6 +130,8 @@ AcpiDsdtFixupStatus (
+     { "\\_SB.ATA0._STA", PcdGet32 (PcdComboPhy0Mode) == COMBO_PHY_MODE_SATA },
+     { "\\_SB.ATA1._STA", PcdGet32 (PcdComboPhy1Mode) == COMBO_PHY_MODE_SATA },
+     { "\\_SB.ATA2._STA", PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_SATA },
++
++    { "\\_SB.GPU0._STA", PcdGet32 (PcdGpuState) == GPU_STATE_ENABLED },
+   };
+ 
+   for (Index = 0; Index < ARRAY_SIZE (DevStatus); Index++) {
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.inf b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.inf
+index c5ef62c..4215bf3 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.inf
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.inf
+@@ -57,6 +57,7 @@
+   gRK3588TokenSpaceGuid.PcdPcie30State
+   gRK3588TokenSpaceGuid.PcdPcie30PhyMode
+   gRK3588TokenSpaceGuid.PcdPcieEcamCompliantSegmentsMask
++  gRK3588TokenSpaceGuid.PcdGpuState
+   gRockchipTokenSpaceGuid.PcdRkSdmmcBaseAddress
+ 
+ [Depex]
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.c b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.c
+new file mode 100644
+index 0000000..efade84
+--- /dev/null
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.c
+@@ -0,0 +1,374 @@
++/** @file
++ *
++ *  Mali-G610 GPU power-up for OSes without a Rockchip power-domain driver
++ *  (Windows, panfrost-win): set a safe clock, ungate the GPU clocks, power
++ *  on PD_GPU and release the GPU NIU from idle, so that the GPU registers
++ *  at 0xFB000000 are readable when the OS starts. The same sequence is
++ *  available at runtime through \_SB.GPU0._PS0/_PS3 (AcpiTables/Gpu.asl).
++ *
++ *  Register meaning cross-checked against TF-A plat/rockchip/rk3588
++ *  (BSD-3-Clause) drivers/pmu/pmu.c and drivers/scmi/rk3588_clk.c, the
++ *  Rockchip CRU HAL IDs in RK3588.h, and the Linux rk3588-base.dtsi GPU
++ *  node. Written from scratch; no GPL code is used.
++ *
++ *  Copyright (c) 2026, panfrost-win contributors
++ *
++ *  SPDX-License-Identifier: MIT
++ *
++ **/
++
++#include <Library/ArmLib.h>
++#include <Library/DebugLib.h>
++#include <Library/IoLib.h>
++#include <Library/PcdLib.h>
++#include <Library/CruLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiRuntimeServicesTableLib.h>
++#include <Protocol/ArmScmi.h>
++#include <Protocol/ArmScmiClockProtocol.h>
++#include <ScmiDefinitions.h>
++#include <VarStoreData.h>
++#include <Soc.h>
++
++#include "RK3588DxeFormSetGuid.h"
++#include "Gpu.h"
++
++//
++// PMU2 (PMU0_BASE 0xFD8D0000 + 0x8000). Writes use the hi-word write mask.
++//
++#define PMU2_BASE                0xFD8D8000
++#define PMU2_BUS_IDLE_SFTCON0    (PMU2_BASE + 0x10C)
++#define PMU2_BUS_IDLE_ACK0       (PMU2_BASE + 0x118)
++#define PMU2_BUS_IDLE_ST0        (PMU2_BASE + 0x120)
++#define PMU2_PWR_GATE_SFTCON0    (PMU2_BASE + 0x14C)
++#define PMU2_PWR_GATE_ST0        (PMU2_BASE + 0x180)
++#define PMU2_BISR_STATUS4        (PMU2_BASE + 0x290)
++
++#define PMU_PD_GPU               BIT0   // PWR_GATE_*: power domain 0
++#define PMU_BUS_ID_GPU           BIT0   // BUS_IDLE_*: NIU 0
++#define PMU_BISR_GPU_ON          BIT1   // BISR_STATUS4: PD_GPU powered + repaired
++
++#define HIWORD_SET(Mask, Val)    (((UINT32)(Mask) << 16) | ((Val) & (Mask)))
++
++//
++// CRU (0xFD7C0000). Gate/reset IDs are the Rockchip HAL IDs from RK3588.h:
++// register index = Id / 16, bit = Id % 16, 1 = gated / in reset.
++//
++#define GPU_CRU_CLKSEL_CON(n)    (CRU_BASE + CRU_CLKSEL_CON_OFFSET + (n) * 4)
++#define GPU_CRU_GATE_REG(Id)     (CRU_BASE + CRU_CLKGATE_CON_OFFSET + CLK_GATE_GET_REG_OFFSET (Id) * 4)
++#define GPU_CRU_SRST_REG(Id)     (CRU_BASE + CRU_SOFTRST_CON_OFFSET + CLK_RESET_GET_REG_OFFSET (Id) * 4)
++
++//
++// CLKSEL_CON158: [4:0] clk_gpu_src divider, [7:5] mux (0 = GPLL),
++// bit14 = 1 selects the GPU PVTPLL (in GPU_GRF) instead of the divided PLL.
++//
++#define GPU_CLKSEL_CON           158
++#define GPU_CLKSEL_DIV_MASK      0x1F
++#define GPU_CLKSEL_MUX_MASK      (0x7 << 5)
++#define GPU_CLKSEL_PVTPLL        BIT14
++#define GPU_GPLL_HZ              1188000000ULL
++
++#define GPU_SAFE_RATE_HZ         200000000ULL   // DT assigned-clock-rates
++#define GPU_POLL_TIMEOUT_US      10000          // Linux/TF-A use ~10 ms / 500 us
++
++#define GPU_BASE                 0xFB000000
++#define GPU_ID_ARCH_PROD_MASK    0xF00F0000
++#define GPU_ID_G610              0xA0070000     // arch_major 10, product_major 7
++
++STATIC CONST UINT32  mGpuClockGates[] = {
++  CLK_GPU_SRC_DF_GATE,
++  CLK_GPU_SRC_GATE,
++  CLK_GPU_GATE,
++  CLK_GPU_COREGROUP_GATE,
++  CLK_GPU_STACKS_GATE,
++  ACLK_S_GPU_NIU_GATE,
++  ACLK_M0_GPU_NIU_GATE,
++  ACLK_M1_GPU_NIU_GATE,
++  ACLK_M2_GPU_NIU_GATE,
++  ACLK_M3_GPU_NIU_GATE,
++  PCLK_GPU_ROOT_GATE,
++  PCLK_GPU_NIU_GATE,
++  CLK_GPU_PVTM_GATE,
++  PCLK_GPU_GRF_GATE,
++  CLK_GPU_PVTPLL_GATE,
++};
++
++STATIC CONST UINT32  mGpuResets[] = {
++  SRST_GPU,
++  SRST_SYS_GPU,
++  SRST_A_S_GPU_NIU,
++  SRST_A_M0_GPU_NIU,
++  SRST_A_M1_GPU_NIU,
++  SRST_A_M2_GPU_NIU,
++  SRST_A_M3_GPU_NIU,
++  SRST_P_GPU_NIU,
++  SRST_P_GPU_GRF,
++  SRST_GPU_PVTPLL,
++};
++
++STATIC BOOLEAN  mGpuSupplyReady;
++STATIC BOOLEAN  mGpuVariablesApplied;
++STATIC BOOLEAN  mGpuPowerOnDone;
++
++STATIC
++BOOLEAN
++GpuWaitReg32 (
++  IN UINTN   Address,
++  IN UINT32  Mask,
++  IN UINT32  Value
++  )
++{
++  UINTN  Timeout;
++
++  for (Timeout = GPU_POLL_TIMEOUT_US; Timeout > 0; Timeout--) {
++    if ((MmioRead32 (Address) & Mask) == Value) {
++      return TRUE;
++    }
++
++    gBS->Stall (1);
++  }
++
++  return (MmioRead32 (Address) & Mask) == Value;
++}
++
++STATIC
++BOOLEAN
++GpuIsPoweredAndActive (
++  VOID
++  )
++{
++  return ((MmioRead32 (PMU2_BISR_STATUS4) & PMU_BISR_GPU_ON) != 0) &&
++         ((MmioRead32 (PMU2_BUS_IDLE_ST0) & PMU_BUS_ID_GPU) == 0) &&
++         ((MmioRead32 (PMU2_BUS_IDLE_ACK0) & PMU_BUS_ID_GPU) == 0);
++}
++
++//
++// Same as TF-A clk_gpu_set_rate(200 MHz, PLL_SEL_NOR): GPLL / 6, PVTPLL
++// path deselected. Only used if the SCMI clock protocol is unavailable.
++//
++STATIC
++VOID
++GpuSetSafeRateDirect (
++  VOID
++  )
++{
++  UINT32  Div;
++
++  Div = (UINT32)((GPU_GPLL_HZ + GPU_SAFE_RATE_HZ - 1) / GPU_SAFE_RATE_HZ) - 1;
++
++  MmioWrite32 (GPU_CRU_CLKSEL_CON (GPU_CLKSEL_CON), HIWORD_SET (GPU_CLKSEL_DIV_MASK, Div));
++  MmioWrite32 (GPU_CRU_CLKSEL_CON (GPU_CLKSEL_CON), HIWORD_SET (GPU_CLKSEL_MUX_MASK, 0));
++  MmioWrite32 (GPU_CRU_CLKSEL_CON (GPU_CLKSEL_CON), HIWORD_SET (GPU_CLKSEL_PVTPLL, 0));
++}
++
++STATIC
++VOID
++GpuSetSafeRate (
++  VOID
++  )
++{
++  EFI_STATUS           Status;
++  SCMI_CLOCK_PROTOCOL  *ClockProtocol;
++  EFI_GUID             ClockProtocolGuid = ARM_SCMI_CLOCK_PROTOCOL_GUID;
++  UINT64               Rate;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "GPU: CLKSEL_CON158 before = 0x%08x\n",
++    MmioRead32 (GPU_CRU_CLKSEL_CON (GPU_CLKSEL_CON))
++    ));
++
++  Status = gBS->LocateProtocol (&ClockProtocolGuid, NULL, (VOID **)&ClockProtocol);
++  if (!EFI_ERROR (Status)) {
++    Status = ClockProtocol->RateSet (ClockProtocol, SCMI_CLK_GPU, GPU_SAFE_RATE_HZ);
++  }
++
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_WARN, "GPU: SCMI rate set failed (%r), programming CRU directly\n", Status));
++    GpuSetSafeRateDirect ();
++    return;
++  }
++
++  Rate   = 0;
++  Status = ClockProtocol->RateGet (ClockProtocol, SCMI_CLK_GPU, &Rate);
++  DEBUG ((DEBUG_INFO, "GPU: SCMI clk_gpu = %lu Hz (%r)\n", Rate, Status));
++}
++
++STATIC
++EFI_STATUS
++GpuPowerOn (
++  VOID
++  )
++{
++  UINTN   Index;
++  UINT32  Reg;
++  UINT32  GpuId;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "GPU: PMU PWR_GATE_ST0=0x%08x BISR_STATUS4=0x%08x BUS_IDLE_ST0=0x%08x ACK0=0x%08x\n",
++    MmioRead32 (PMU2_PWR_GATE_ST0),
++    MmioRead32 (PMU2_BISR_STATUS4),
++    MmioRead32 (PMU2_BUS_IDLE_ST0),
++    MmioRead32 (PMU2_BUS_IDLE_ACK0)
++    ));
++
++  //
++  // 1. Safe clock rate before the domain comes up (Linux applies
++  //    assigned-clock-rates before attaching the power domain). 200 MHz is
++  //    in spec at any vdd_gpu and does not touch GPU_GRF, which is inside
++  //    PD_GPU.
++  //
++  GpuSetSafeRate ();
++
++  //
++  // 2. Ungate every GPU clock (core, coregroup, stacks, NIU a/pclks, GRF,
++  //    PVTM/PVTPLL) and make sure no GPU reset is held.
++  //
++  for (Index = 0; Index < ARRAY_SIZE (mGpuClockGates); Index++) {
++    Reg = mGpuClockGates[Index];
++    MmioWrite32 (GPU_CRU_GATE_REG (Reg), HIWORD_SET (1U << CLK_GATE_GET_BITS_SHIFT (Reg), 0));
++  }
++
++  for (Index = 0; Index < ARRAY_SIZE (mGpuResets); Index++) {
++    Reg = mGpuResets[Index];
++    if ((MmioRead32 (GPU_CRU_SRST_REG (Reg)) & (1U << CLK_RESET_GET_BITS_SHIFT (Reg))) != 0) {
++      DEBUG ((DEBUG_INFO, "GPU: releasing CRU reset %u\n", Reg));
++    }
++
++    MmioWrite32 (GPU_CRU_SRST_REG (Reg), HIWORD_SET (1U << CLK_RESET_GET_BITS_SHIFT (Reg), 0));
++  }
++
++  //
++  // 3. Power on PD_GPU and wait for the memory repair (BISR) to complete.
++  //
++  if ((MmioRead32 (PMU2_BISR_STATUS4) & PMU_BISR_GPU_ON) == 0) {
++    MmioWrite32 (PMU2_PWR_GATE_SFTCON0, HIWORD_SET (PMU_PD_GPU, 0));
++    ArmDataSynchronizationBarrier ();
++
++    if (!GpuWaitReg32 (PMU2_BISR_STATUS4, PMU_BISR_GPU_ON, PMU_BISR_GPU_ON)) {
++      DEBUG ((
++        DEBUG_ERROR,
++        "GPU: PD_GPU power-on timeout (PWR_GATE_ST0=0x%08x BISR_STATUS4=0x%08x)\n",
++        MmioRead32 (PMU2_PWR_GATE_ST0),
++        MmioRead32 (PMU2_BISR_STATUS4)
++        ));
++      return EFI_TIMEOUT;
++    }
++  }
++
++  //
++  // 4. Take the GPU NIU out of idle and wait for both ACK and status to drop.
++  //
++  MmioWrite32 (PMU2_BUS_IDLE_SFTCON0, HIWORD_SET (PMU_BUS_ID_GPU, 0));
++  ArmDataSynchronizationBarrier ();
++
++  if (!GpuWaitReg32 (PMU2_BUS_IDLE_ACK0, PMU_BUS_ID_GPU, 0) ||
++      !GpuWaitReg32 (PMU2_BUS_IDLE_ST0, PMU_BUS_ID_GPU, 0))
++  {
++    DEBUG ((
++      DEBUG_ERROR,
++      "GPU: NIU idle release timeout (BUS_IDLE_ST0=0x%08x ACK0=0x%08x)\n",
++      MmioRead32 (PMU2_BUS_IDLE_ST0),
++      MmioRead32 (PMU2_BUS_IDLE_ACK0)
++      ));
++    return EFI_TIMEOUT;
++  }
++
++  //
++  // 5. The domain is up: GPU_ID is now safe to read.
++  //
++  GpuId = MmioRead32 (GPU_BASE);
++  DEBUG ((
++    DEBUG_INFO,
++    "GPU: powered on, GPU_ID=0x%08x (arch %u.%u.%u, product %u, r%up%u, status %u)%a\n",
++    GpuId,
++    GpuId >> 28,
++    (GpuId >> 24) & 0xF,
++    (GpuId >> 20) & 0xF,
++    (GpuId >> 16) & 0xF,
++    (GpuId >> 12) & 0xF,
++    (GpuId >> 4) & 0xFF,
++    GpuId & 0xF,
++    ((GpuId & GPU_ID_ARCH_PROD_MASK) == GPU_ID_G610) ? " Mali-G610" : " (unexpected)"
++    ));
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++VOID
++GpuTryPowerOn (
++  VOID
++  )
++{
++  EFI_STATUS  Status;
++
++  //
++  // ApplyVariables() may run before or after RK3588InitPeripherals() has
++  // configured the RK806 (vdd_gpu_s0), so wait for both.
++  //
++  if (!mGpuSupplyReady || !mGpuVariablesApplied || mGpuPowerOnDone) {
++    return;
++  }
++
++  mGpuPowerOnDone = TRUE;
++
++  if (PcdGet32 (PcdGpuState) != GPU_STATE_ENABLED) {
++    DEBUG ((DEBUG_INFO, "GPU: disabled in setup, leaving PD_GPU untouched\n"));
++    return;
++  }
++
++  if (GpuIsPoweredAndActive ()) {
++    DEBUG ((DEBUG_INFO, "GPU: PD_GPU already on\n"));
++  }
++
++  Status = GpuPowerOn ();
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "GPU: power-on failed: %r. Do not touch 0xFB000000.\n", Status));
++  }
++}
++
++VOID
++EFIAPI
++GpuNotifySupplyReady (
++  VOID
++  )
++{
++  mGpuSupplyReady = TRUE;
++  GpuTryPowerOn ();
++}
++
++VOID
++EFIAPI
++ApplyGpuVariables (
++  VOID
++  )
++{
++  mGpuVariablesApplied = TRUE;
++  GpuTryPowerOn ();
++}
++
++VOID
++EFIAPI
++SetupGpuVariables (
++  VOID
++  )
++{
++  UINTN       Size;
++  UINT32      Var32;
++  EFI_STATUS  Status;
++
++  Size   = sizeof (UINT32);
++  Status = gRT->GetVariable (
++                  L"GpuState",
++                  &gRK3588DxeFormSetGuid,
++                  NULL,
++                  &Size,
++                  &Var32
++                  );
++  if (EFI_ERROR (Status)) {
++    Status = PcdSet32S (PcdGpuState, GPU_STATE_ENABLED);
++    ASSERT_EFI_ERROR (Status);
++  }
++}
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.h b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.h
+new file mode 100644
+index 0000000..7c016a4
+--- /dev/null
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/Gpu.h
+@@ -0,0 +1,42 @@
++/** @file
++ *
++ *  Mali-G610 GPU power-up (panfrost-win).
++ *
++ *  Copyright (c) 2026, panfrost-win contributors
++ *
++ *  SPDX-License-Identifier: MIT
++ *
++ **/
++
++#ifndef __RK3588DXE_GPU_H__
++#define __RK3588DXE_GPU_H__
++
++//
++// Don't declare these in the VFR file.
++//
++#ifndef VFR_FILE_INCLUDE
++
++//
++// Called once vdd_gpu_s0 has been configured by Rk806Configure().
++//
++VOID
++EFIAPI
++GpuNotifySupplyReady (
++  VOID
++  );
++
++VOID
++EFIAPI
++ApplyGpuVariables (
++  VOID
++  );
++
++VOID
++EFIAPI
++SetupGpuVariables (
++  VOID
++  );
++
++#endif // VFR_FILE_INCLUDE
++
++#endif // __RK3588DXE_GPU_H__
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.c b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.c
+index e1e4688..82bfacf 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.c
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.c
+@@ -40,6 +40,7 @@
+ #include "UsbDpPhy.h"
+ #include "DebugSerialPort.h"
+ #include "Display.h"
++#include "Gpu.h"
+ 
+ extern UINT8  RK3588DxeHiiBin[];
+ extern UINT8  RK3588DxeStrings[];
+@@ -199,6 +200,7 @@ SetupVariables (
+   SetupUsbDpPhyVariables ();
+   SetupDebugSerialPortVariables ();
+   SetupDisplayVariables ();
++  SetupGpuVariables ();
+ 
+   return EFI_SUCCESS;
+ }
+@@ -247,6 +249,7 @@ ApplyVariables (
+   ApplyUsbDpPhyVariables ();
+   ApplyDebugSerialPortVariables ();
+   ApplyDisplayVariables ();
++  ApplyGpuVariables ();
+ 
+   InstallConfigAppliedProtocol ();
+ 
+@@ -302,6 +305,9 @@ RK3588InitPeripherals (
+ 
+   Rk806Configure ();
+ 
++  // vdd_gpu_s0 (RK806 BUCK1) is now on, the GPU may be powered up.
++  GpuNotifySupplyReady ();
++
+   return EFI_SUCCESS;
+ }
+ 
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.inf b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.inf
+index b17ab8f..2f033f2 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.inf
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588Dxe.inf
+@@ -26,6 +26,7 @@
+   UsbDpPhy.c
+   DebugSerialPort.c
+   Display.c
++  Gpu.c
+ 
+ [Packages]
+   ArmPkg/ArmPkg.dec
+@@ -143,6 +144,8 @@
+   gRK3588TokenSpaceGuid.PcdHdmiSignalingModeDefault
+   gRK3588TokenSpaceGuid.PcdHdmiSignalingMode
+ 
++  gRK3588TokenSpaceGuid.PcdGpuState
++
+ [Guids]
+   gRK3588DxeFormSetGuid
+ 
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.uni b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.uni
+index 7360c0d..1784cf9 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.uni
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.uni
+@@ -315,3 +315,13 @@
+ #string STR_DEBUG_SERIAL_PORT_SUBTITLE                     #language en-US "Note: These settings only take effect in UEFI and might be overridden by the OS. Earlier boot messages will be printed at the default settings."
+ 
+ #string STR_DEBUG_SERIAL_PORT_BAUD_RATE_PROMPT             #language en-US "Baud Rate"
++
++/*
++ * GPU (Mali-G610) configuration
++ */
++#string STR_GPU_FORM_TITLE                                 #language en-US "GPU"
++#string STR_GPU_FORM_HELP                                  #language en-US "Configure the Mali-G610 GPU."
++#string STR_GPU_SUBTITLE                                   #language en-US "When enabled, the firmware powers on the GPU power domain (PD_GPU) at a safe 200 MHz clock and exposes the GPU to the OS as ACPI device RKCP7410. A separate OS driver is required."
++
++#string STR_GPU_STATE_PROMPT                               #language en-US "GPU"
++#string STR_GPU_STATE_HELP                                 #language en-US "Enable or disable the GPU power domain and ACPI device."
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.vfr b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.vfr
+index 61ee79a..0d1998c 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.vfr
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Drivers/RK3588Dxe/RK3588DxeHii.vfr
+@@ -243,6 +243,11 @@ formset
+       name  = DebugSerialPortBaudRate,
+       guid  = RK3588DXE_FORMSET_GUID;
+ 
++    efivarstore GPU_STATE_VARSTORE_DATA,
++      attribute = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS | EFI_VARIABLE_NON_VOLATILE,
++      name  = GpuState,
++      guid  = RK3588DXE_FORMSET_GUID;
++
+     form formid = 1,
+       title  = STRING_TOKEN(STR_FORM_SET_TITLE);
+       subtitle text = STRING_TOKEN(STR_FORM_SET_TITLE_SUBTITLE);
+@@ -288,6 +293,10 @@ formset
+       goto 0x1007,
+         prompt = STRING_TOKEN(STR_DEBUG_SERIAL_PORT_FORM_TITLE),
+         help = STRING_TOKEN(STR_DEBUG_SERIAL_PORT_FORM_HELP);
++
++      goto 0x1008,
++        prompt = STRING_TOKEN(STR_GPU_FORM_TITLE),
++        help = STRING_TOKEN(STR_GPU_FORM_HELP);
+     endform;
+ 
+     form formid = 0x1000,
+@@ -945,4 +954,20 @@ formset
+         subtitle text = STRING_TOKEN(STR_DEBUG_SERIAL_PORT_SUBTITLE);
+     endform;
+ 
++    form formid = 0x1008,
++        title  = STRING_TOKEN(STR_GPU_FORM_TITLE);
++
++        oneof varid = GpuState.State,
++          prompt      = STRING_TOKEN(STR_GPU_STATE_PROMPT),
++          help        = STRING_TOKEN(STR_GPU_STATE_HELP),
++          flags       = NUMERIC_SIZE_4 | INTERACTIVE | RESET_REQUIRED,
++          default     = GPU_STATE_ENABLED,
++          option text = STRING_TOKEN(STR_DISABLED), value = GPU_STATE_DISABLED, flags = 0;
++          option text = STRING_TOKEN(STR_ENABLED), value = GPU_STATE_ENABLED, flags = 0;
++        endoneof;
++
++        subtitle text = STRING_TOKEN(STR_NULL_STRING);
++        subtitle text = STRING_TOKEN(STR_GPU_SUBTITLE);
++    endform;
++
+ endformset;
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/Include/VarStoreData.h b/edk2-rockchip/Silicon/Rockchip/RK3588/Include/VarStoreData.h
+index d584a09..a4f4e60 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/Include/VarStoreData.h
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/Include/VarStoreData.h
+@@ -157,6 +157,12 @@ typedef struct {
+ #define HDMI_SIGNALING_MODE_DVI   1
+ #define HDMI_SIGNALING_MODE_HDMI  2
+ 
++#define GPU_STATE_DISABLED  0
++#define GPU_STATE_ENABLED   1
++typedef struct {
++  UINT32    State;
++} GPU_STATE_VARSTORE_DATA;
++
+ #pragma pack ()
+ 
+ #endif // __VARSTORE_DATA_H__
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588.dec b/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588.dec
+index cce5971..4745b7b 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588.dec
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588.dec
+@@ -170,5 +170,7 @@
+   gRK3588TokenSpaceGuid.PcdDisplayRotation|0|UINT16|0x00000807
+   gRK3588TokenSpaceGuid.PcdHdmiSignalingMode|0|UINT8|0x00000808
+ 
++  gRK3588TokenSpaceGuid.PcdGpuState|0|UINT32|0x00000901
++
+ [PcdsDynamicEx]
+   gRK3588TokenSpaceGuid.PcdPcieEcamCompliantSegmentsMask|0|UINT32|0x20000001
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588Base.dsc.inc b/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588Base.dsc.inc
+index 5ec8afc..75bf44a 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588Base.dsc.inc
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/RK3588Base.dsc.inc
+@@ -43,6 +43,8 @@
+ 
+   DEFINE COOLING_FAN_STATE_DISABLED   = 0
+   DEFINE COOLING_FAN_STATE_ENABLED    = 1
++  DEFINE GPU_STATE_DISABLED           = 0
++  DEFINE GPU_STATE_ENABLED            = 1
+ 
+   DEFINE USBDP_PHY_USB3_STATE_DISABLED  = 0
+   DEFINE USBDP_PHY_USB3_STATE_ENABLED   = 1
+@@ -403,6 +405,11 @@
+   gRK3588TokenSpaceGuid.PcdDisplayRotation|L"DisplayRotation"|gRK3588DxeFormSetGuid|0x0|gRK3588TokenSpaceGuid.PcdDisplayRotationDefault
+   gRK3588TokenSpaceGuid.PcdHdmiSignalingMode|L"HdmiSignalingMode"|gRK3588DxeFormSetGuid|0x0|gRK3588TokenSpaceGuid.PcdHdmiSignalingModeDefault
+ 
++  #
++  # GPU (Mali-G610)
++  #
++  gRK3588TokenSpaceGuid.PcdGpuState|L"GpuState"|gRK3588DxeFormSetGuid|0x0|$(GPU_STATE_ENABLED)
++
+ ################################################################################
+ #
+ # Components Section - list of all common EDK II Modules needed by RK3588 platforms.
+-- 
+2.56.0
+

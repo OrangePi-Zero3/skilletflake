@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:32:57 +0000
+Subject: [PATCH 11/14] panvk: identify the driver binary without an ELF
+ build-id
+
+The pipeline-cache and driver UUIDs come from the ELF build-id, which
+doesn't exist on Windows. When HAVE_BUILD_ID is 0, hash the
+disk_cache_get_function_identifier() of the driver instead, like dozen
+does.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_instance.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index b519885..c261536 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include "util/build_id.h"
++#include "util/disk_cache.h"
+ #include "panvk_drirc.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_misc.h"
+@@ -215,6 +216,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    panvk_debug_init();
+    pan_trace_init();
+ 
++#if HAVE_BUILD_ID
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(panvk_CreateInstance);
+    if (!note) {
+@@ -227,6 +229,18 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+       return panvk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+                           "build-id too short.  It needs to be a SHA");
+    }
++#else
++   /* No ELF build-id (e.g. Windows): identify the driver binary through the
++    * disk-cache function identifier, like dozen does.
++    */
++   blake3_hasher build_ctx;
++   _mesa_blake3_init(&build_ctx);
++   if (!disk_cache_get_function_identifier(panvk_CreateInstance,
++                                           &build_ctx)) {
++      return panvk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
++                          "Failed to identify the driver binary");
++   }
++#endif
+ 
+    pAllocator = pAllocator ?: vk_default_allocator();
+    instance = vk_zalloc(pAllocator, sizeof(*instance), 8,
+@@ -265,7 +279,11 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
+ 
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
++#if HAVE_BUILD_ID
+    copy_build_id_to_sha1(instance->driver_build_sha, note);
++#else
++   _mesa_blake3_final(&build_ctx, instance->driver_build_sha);
++#endif
+ 
+    *pInstance = panvk_instance_to_handle(instance);
+ 

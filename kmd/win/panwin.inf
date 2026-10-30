@@ -1,0 +1,86 @@
+; SPDX-License-Identifier: MIT
+;
+; panwin.inf - panfrost-win KMDF driver for the Rockchip RK3588 Mali-G610 GPU (ACPI RKCP7410).
+;
+; Package layout (flat directory next to this INF):
+;   panwin.inf  panwin.sys  panwin.cat  mali_csffw.bin
+; mali_csffw.bin is Arm's CSF firmware (arch10.8). It is installed where pw_os_win.c looks:
+;   FirmwareRoot (default \SystemRoot\System32\drivers\panwin\) + arm\mali\arch10.8\mali_csffw.bin
+; See docs/bringup/windows-install.md. Test-signed only; UNTESTED ON HARDWARE.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = panwin.cat
+DriverVer   = 10/30/2026,0.1.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir    = 12
+Panwin_CopyFiles  = 12
+Panwin_FwFiles    = 12,panwin\arm\mali\arch10.8
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+panwin.sys     = 1,,
+mali_csffw.bin = 1,,
+
+[Manufacturer]
+%MfgName% = Panwin,NTarm64.10.0...19041
+
+[Panwin.NTarm64.10.0...19041]
+; _HID "RKCP7410" from our edk2-rk3588 patch. The ACPI enumerator reports both forms.
+%DeviceDesc% = Panwin_Device, ACPI\RKCP7410
+%DeviceDesc% = Panwin_Device, ACPI\VEN_RKCP&DEV_7410
+
+[Panwin_Device.NT]
+CopyFiles = Panwin_CopyFiles, Panwin_FwFiles
+
+[Panwin_CopyFiles]
+panwin.sys
+
+[Panwin_FwFiles]
+mali_csffw.bin
+
+[Panwin_Device.NT.HW]
+AddReg = Panwin_HW_AddReg
+
+[Panwin_HW_AddReg]
+; Device object security: SYSTEM and Administrators full access, everyone else read/write
+; (like a Linux DRM render node). FILE_DEVICE_SECURE_OPEN is also set by the driver.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+HKR,,DeviceCharacteristics,0x10001,0x100
+; Driver parameters, read from the device's "Device Parameters" key (PLUGPLAY_REGKEY_DEVICE).
+; BootFirmware: 0 = M1 bring-up (GPU_ID, reset, L2 only), 1 = load + boot the CSF firmware.
+HKR,,BootFirmware,0x00010001,0
+; NT path of the firmware root; the core appends "arm/mali/arch<maj>.<min>/mali_csffw.bin".
+HKR,,FirmwareRoot,0x00000000,"\SystemRoot\System32\drivers\panwin\"
+; Read the RK3588 PMU's PD_GPU status before touching GPU registers (1 = on, recommended).
+HKR,,Rk3588PmuCheck,0x00010001,1
+
+[Panwin_Device.NT.Services]
+AddService = panwin,0x00000002,Panwin_Service
+
+[Panwin_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START (PnP starts it)
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\panwin.sys
+
+[Panwin_Device.NT.Wdf]
+KmdfService = panwin, Panwin_WdfSect
+
+[Panwin_WdfSect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+ProviderName = "panfrost-win"
+MfgName      = "panfrost-win (Rockchip RK3588)"
+DeviceDesc   = "Arm Mali-G610 GPU (panfrost-win, test)"
+DiskName     = "panfrost-win driver package"
+ServiceName  = "panfrost-win Mali GPU driver"

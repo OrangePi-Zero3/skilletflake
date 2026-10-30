@@ -1,0 +1,334 @@
+From f2e1e6bebc8a71aec3e4e98c26b4fd077fa207e9 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:09:32 +0000
+Subject: [PATCH 1/3] RK3588: add ACPI device for the Mali-G610 GPU
+
+Add \_SB.GPU0 (HID RKCP7410) to the common DSDT so that every RK3588/RK3588S
+platform exposes the Mali-G610 MP4 (Valhall v10, CSF) to the OS:
+
+- _CRS: 0xFB000000/0x200000 and GSIV 124/125/126 (job, mmu, gpu), level
+  high, from Linux rk3588-base.dtsi GIC_SPI 92/93/94.
+- _CCA 0: the GPU is not IO-coherent.
+- _STA as a Name so AcpiPlatformDxe can hide the device.
+- _PS0/_PS3/_PSC: PD_GPU power on/off with NIU idle handshake and clock
+  (un)gating through PMU2/CRU OperationRegions; the clock is parked at
+  200 MHz (GPLL path) through \_SB.SCMI before power transitions.
+- _DSM (102bc718-f3be-4e3c-8e12-dc78892ef9a5): SCMI GPU clock get/set
+  bounded by BOARD_GPU_MAX_FREQ_HZ (800 MHz at the 750 mV vdd_gpu most
+  boards program, 1 GHz on Orange Pi 5 at 850 mV), and PMU diagnostics.
+
+There is no PRP0001 _CID, so Linux in ACPI mode ignores the device.
+
+Untested on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../OrangePi/OrangePi5/AcpiTables/Dsdt.asl    |   3 +
+ .../Rockchip/RK3588/AcpiTables/DsdtCommon.asl |   1 +
+ .../Rockchip/RK3588/AcpiTables/Gpu.asl        | 270 ++++++++++++++++++
+ 3 files changed, 274 insertions(+)
+ create mode 100644 edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/Gpu.asl
+
+diff --git a/edk2-rockchip/Platform/OrangePi/OrangePi5/AcpiTables/Dsdt.asl b/edk2-rockchip/Platform/OrangePi/OrangePi5/AcpiTables/Dsdt.asl
+index 796403d..535dd52 100755
+--- a/edk2-rockchip/Platform/OrangePi/OrangePi5/AcpiTables/Dsdt.asl
++++ b/edk2-rockchip/Platform/OrangePi/OrangePi5/AcpiTables/Dsdt.asl
+@@ -21,6 +21,9 @@
+ #define BOARD_CODEC_GPIO "\\_SB.GPI1"
+ #define BOARD_CODEC_GPIO_PIN GPIO_PIN_PD5
+ 
++// vdd_gpu_s0 (RK806 BUCK1) is set to 850 mV by Rk806Configure() on this board.
++#define BOARD_GPU_MAX_FREQ_HZ 1000000000
++
+ DefinitionBlock ("Dsdt.aml", "DSDT", 2, "RKCP  ", "RK3588  ", 2)
+ {
+   Scope (\_SB_)
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/DsdtCommon.asl b/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/DsdtCommon.asl
+index 7b8afe6..1eec542 100644
+--- a/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/DsdtCommon.asl
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/DsdtCommon.asl
+@@ -10,4 +10,5 @@
+ 
+ Scope (\_SB_) {
+   Include ("Scmi.asl")
++  Include ("Gpu.asl")
+ }
+diff --git a/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/Gpu.asl b/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/Gpu.asl
+new file mode 100644
+index 0000000..8fc135e
+--- /dev/null
++++ b/edk2-rockchip/Silicon/Rockchip/RK3588/AcpiTables/Gpu.asl
+@@ -0,0 +1,270 @@
++/** @file
++ *
++ *  Arm Mali-G610 MP4 (Valhall v10, CSF) GPU device for Windows (panfrost-win).
++ *
++ *  Register meaning cross-checked against TF-A plat/rockchip/rk3588
++ *  (BSD-3-Clause) pmu.c / rk3588_clk.c and the Linux rk3588-base.dtsi
++ *  gpu@fb000000 node. Written from scratch; no GPL code is used.
++ *
++ *  Copyright (c) 2026, panfrost-win contributors
++ *
++ *  SPDX-License-Identifier: MIT
++ *
++ **/
++
++#include "AcpiTables.h"
++
++//
++// Highest GPU clock that is in spec at the vdd_gpu_s0 (RK806 BUCK1) voltage
++// set by the board's Rk806Configure(). Linux rk3588-opp.dtsi: 800 MHz needs
++// 750 mV, 1 GHz needs 850 mV. A board that programs more can override this
++// before including DsdtCommon.asl.
++//
++#ifndef BOARD_GPU_MAX_FREQ_HZ
++#define BOARD_GPU_MAX_FREQ_HZ   800000000
++#endif
++
++// SCMI_CLK_GPU (ScmiDefinitions.h)
++#define GPU_SCMI_CLK_ID         5
++// GPLL/6 path, does not touch GPU_GRF
++#define GPU_SAFE_FREQ_HZ        200000000
++#define GPU_MIN_FREQ_HZ         200000000
++// TF-A rk3588_gpu_rates[] step
++#define GPU_FREQ_STEP_HZ        100000000
++
++//
++// PMU2 block (TF-A PMU0_BASE 0xFD8D0000 + 0x8000). All *_SFTCON writes use
++// the Rockchip hi-word write mask (bits 31:16 enable bits 15:0).
++// PD_GPU = power domain 0, BUS_ID_GPU = NIU 0, repair status = BISR_STATUS4 bit1.
++//
++#define GPU_PMU2_BASE           0xFD8D8000
++#define GPU_PMU2_SIZE           0x300
++
++// PWR_GATE_SFTCON0 bit0 = 0
++#define GPU_PD_ON               0x00010000
++// PWR_GATE_SFTCON0 bit0 = 1
++#define GPU_PD_OFF              0x00010001
++// BUS_IDLE_SFTCON0 bit0 = 0
++#define GPU_IDLE_RELEASE        0x00010000
++// BUS_IDLE_SFTCON0 bit0 = 1
++#define GPU_IDLE_REQUEST        0x00010001
++
++//
++// CRU: CLKGATE_CON66/67 (0x908/0x90C), 1 = gated.
++//  CON66: b1 clk_gpu_src_df, b3 clk_gpu_src, b4 clk_gpu, b6 clk_gpu_coregroup,
++//         b7 clk_gpu_stacks, b8-b12 aclk_{s,m0..m3}_gpu_niu, b13 pclk_gpu_root,
++//         b14 pclk_gpu_niu
++//  CON67: b1 clk_gpu_pvtm, b2 pclk_gpu_grf, b3 clk_gpu_pvtpll
++//
++#define GPU_CRU_GATE_BASE       0xFD7C0908
++#define GPU_CRU_GATE66_UNGATE   0x7FDA0000
++#define GPU_CRU_GATE67_UNGATE   0x000E0000
++// gate clk_gpu/coregroup/stacks only
++#define GPU_CRU_GATE66_CORE_OFF 0x00D000D0
++
++// x Stall(10) = 10 ms
++#define GPU_POLL_ITERATIONS     1000
++#define GPU_DSM_STATUS_REJECTED 0xFFFFFFFF
++
++Device (GPU0) {
++  Name (_HID, "RKCP7410")         // must match PANWIN_ACPI_HID
++  Name (_UID, 0)
++  Name (_CCA, 0)                  // not IO-coherent (no dma-coherent in DT)
++  Name (_STA, 0xF)                // patched to 0 by AcpiPlatformDxe if disabled in setup
++
++  Method (_CRS, 0x0, Serialized) {
++    Name (RBUF, ResourceTemplate () {
++      Memory32Fixed (ReadWrite, 0xFB000000, 0x200000)
++      Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 124 }  // job (SPI 92)
++      Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 125 }  // mmu (SPI 93)
++      Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 126 }  // gpu (SPI 94)
++    })
++    Return (RBUF)
++  }
++
++  //
++  // Informational only. No PRP0001 _CID: Linux panthor has no ACPI
++  // clock/power-domain glue and must keep using DT mode.
++  //
++  Name (_DSD, Package () {
++    ToUUID ("daffd814-6eba-4d8c-8a91-bc9bbf4aa301"),
++    Package () {
++      Package () { "compatible", Package () { "rockchip,rk3588-mali", "arm,mali-valhall-csf" } },
++      Package () { "interrupt-names", Package () { "job", "mmu", "gpu" } },
++      Package () { "dynamic-power-coefficient", 2982 },
++    }
++  })
++
++  OperationRegion (PMUR, SystemMemory, GPU_PMU2_BASE, GPU_PMU2_SIZE)
++  Field (PMUR, DWordAcc, NoLock, Preserve) {
++    Offset (0x10C), IREQ, 32,     // BUS_IDLE_SFTCON0
++    Offset (0x118), IACK, 32,     // BUS_IDLE_ACK0
++    Offset (0x120), IDST, 32,     // BUS_IDLE_ST0
++    Offset (0x14C), PGCN, 32,     // PWR_GATE_SFTCON0
++    Offset (0x180), PGST, 32,     // PWR_GATE_ST0 (bit0 = 1: off)
++    Offset (0x290), BISR, 32,     // BISR_STATUS4 (bit1 = 1: GPU on, repaired)
++  }
++
++  OperationRegion (CRUG, SystemMemory, GPU_CRU_GATE_BASE, 0x8)
++  Field (CRUG, DWordAcc, NoLock, Preserve) {
++    GT66, 32,                     // CLKGATE_CON66
++    GT67, 32,                     // CLKGATE_CON67
++  }
++
++  // Sticky error bits for diagnostics (_DSM function 4):
++  //   bit0 PD on timeout, bit1 idle release timeout,
++  //   bit2 idle request timeout, bit3 PD off timeout
++  Name (GERR, 0)
++
++  // 1 if PD_GPU is powered and its NIU is out of idle, i.e. registers are safe.
++  Method (GPON, 0, Serialized) {
++    If (((BISR & 0x2) != 0) && ((IDST & 0x1) == 0) && ((IACK & 0x1) == 0)) {
++      Return (1)
++    }
++    Return (0)
++  }
++
++  Method (_PS0, 0, Serialized) {
++    If (GPON () == 1) {
++      // Already up (powered at DXE by RK3588Dxe). Keep the driver's clock rate.
++      GT66 = GPU_CRU_GATE66_UNGATE
++      GT67 = GPU_CRU_GATE67_UNGATE
++      Return ()
++    }
++
++    // Safe rate first: puts clk_gpu_src on GPLL, independent of vdd and GPU_GRF.
++    \_SB.SCMI.CLRS (GPU_SCMI_CLK_ID, GPU_SAFE_FREQ_HZ)
++
++    GT66 = GPU_CRU_GATE66_UNGATE
++    GT67 = GPU_CRU_GATE67_UNGATE
++
++    If ((BISR & 0x2) == 0) {
++      PGCN = GPU_PD_ON
++      Local0 = GPU_POLL_ITERATIONS
++      While (((BISR & 0x2) == 0) && (Local0 > 0)) {
++        Stall (10)
++        Local0--
++      }
++      If ((BISR & 0x2) == 0) {
++        GERR |= 0x1
++        Return ()                 // do not release the NIU of an unpowered domain
++      }
++    }
++
++    IREQ = GPU_IDLE_RELEASE
++    Local0 = GPU_POLL_ITERATIONS
++    While ((((IACK & 0x1) != 0) || ((IDST & 0x1) != 0)) && (Local0 > 0)) {
++      Stall (10)
++      Local0--
++    }
++    If (((IACK & 0x1) != 0) || ((IDST & 0x1) != 0)) {
++      GERR |= 0x2
++    }
++  }
++
++  //
++  // The driver must have quiesced the GPU first: MCU halted, no AS active,
++  // L2 flushed and powered down (panthor: panthor_device_suspend()).
++  //
++  Method (_PS3, 0, Serialized) {
++    If ((BISR & 0x2) == 0) {
++      Return ()                   // already off
++    }
++
++    // Move clk_gpu_src off the PVTPLL (which lives in GPU_GRF) before PD off.
++    \_SB.SCMI.CLRS (GPU_SCMI_CLK_ID, GPU_SAFE_FREQ_HZ)
++
++    IREQ = GPU_IDLE_REQUEST
++    Local0 = GPU_POLL_ITERATIONS
++    While ((((IACK & 0x1) == 0) || ((IDST & 0x1) == 0)) && (Local0 > 0)) {
++      Stall (10)
++      Local0--
++    }
++    If (((IACK & 0x1) == 0) || ((IDST & 0x1) == 0)) {
++      // Bus did not drain: powering off now could hang the interconnect.
++      GERR |= 0x4
++      IREQ = GPU_IDLE_RELEASE
++      Return ()
++    }
++
++    PGCN = GPU_PD_OFF
++    Local0 = GPU_POLL_ITERATIONS
++    While (((BISR & 0x2) != 0) && (Local0 > 0)) {
++      Stall (10)
++      Local0--
++    }
++    If ((BISR & 0x2) != 0) {
++      GERR |= 0x8
++    }
++
++    GT66 = GPU_CRU_GATE66_CORE_OFF
++  }
++
++  Method (_PSC, 0, Serialized) {
++    If (GPON () == 1) {
++      Return (0)
++    }
++    Return (3)
++  }
++
++  //
++  // Driver-private interface for DVFS (panfrost-win).
++  // UUID 102bc718-f3be-4e3c-8e12-dc78892ef9a5, revision 0.
++  //   0: supported functions bitmask
++  //   1: get GPU clock rate      -> Integer Hz (0 on SCMI error)
++  //   2: set GPU clock rate      Arg3 = Package () { Hz }
++  //                              -> Integer: 0 ok, SCMI status, or 0xFFFFFFFF
++  //                                 if rejected (not a 100 MHz step in
++  //                                 [200 MHz, max], or > 200 MHz while off)
++  //   3: get max safe rate       -> Integer Hz (BOARD_GPU_MAX_FREQ_HZ)
++  //   4: power diagnostics       -> Package () { PGST, BISR, IDST, IACK,
++  //                                              GT66, GT67, GERR }
++  // TODO: 5: set vdd_gpu (uV) via \_SB.SCMI.VDLS, needs a TF-A SCMI voltage
++  //       domain for RK806 BUCK1 (see firmware/edk2-rk3588/patches/README.md).
++  //
++  Method (_DSM, 4, Serialized) {
++    If (Arg0 == ToUUID ("102bc718-f3be-4e3c-8e12-dc78892ef9a5")) {
++      Switch (ToInteger (Arg2)) {
++        Case (0) {
++          Return (Buffer () { 0x1F })
++        }
++        Case (1) {
++          Local0 = \_SB.SCMI.CLRG (GPU_SCMI_CLK_ID)
++          If (DerefOf (Local0[0]) != 0) {
++            Return (0)
++          }
++          Return (DerefOf (Local0[1]))
++        }
++        Case (2) {
++          Local1 = DerefOf (Arg3[0])
++          If ((Local1 < GPU_MIN_FREQ_HZ) || (Local1 > BOARD_GPU_MAX_FREQ_HZ) ||
++              ((Local1 % GPU_FREQ_STEP_HZ) != 0)) {
++            Return (GPU_DSM_STATUS_REJECTED)
++          }
++          // >= 300 MHz uses the PVTPLL in GPU_GRF, which needs PD_GPU on.
++          If ((Local1 > GPU_SAFE_FREQ_HZ) && (GPON () == 0)) {
++            Return (GPU_DSM_STATUS_REJECTED)
++          }
++          Local0 = \_SB.SCMI.CLRS (GPU_SCMI_CLK_ID, Local1)
++          Return (DerefOf (Local0[0]))
++        }
++        Case (3) {
++          Return (BOARD_GPU_MAX_FREQ_HZ)
++        }
++        Case (4) {
++          // Copy values: named fields inside a Package () would be references.
++          Local0 = Package (7) { 0, 0, 0, 0, 0, 0, 0 }
++          Local0[0] = PGST
++          Local0[1] = BISR
++          Local0[2] = IDST
++          Local0[3] = IACK
++          Local0[4] = GT66
++          Local0[5] = GT67
++          Local0[6] = GERR
++          Return (Local0)
++        }
++      }
++    }
++    Return (Buffer () { 0 })
++  }
++}
+-- 
+2.56.0
+

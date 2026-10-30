@@ -7,4 +7,4 @@ that speaks the Linux panthor uAPI with Mesa's panvk Vulkan driver, cross-built 
 See [docs/PLAN.md](docs/PLAN.md) for the architecture, decisions and milestones, and
 [docs/research/](docs/research/) for the background research.
 
-Status: M0 (foundations, no hardware yet).
+Status: M0 (hardware-free foundations) done; M1 needs an RK3588 board. See docs/status/.

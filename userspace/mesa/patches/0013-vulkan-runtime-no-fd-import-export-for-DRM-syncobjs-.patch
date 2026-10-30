@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:59:59 +0000
+Subject: [PATCH 13/14] vulkan/runtime: no fd import/export for DRM syncobjs on
+ Windows
+
+A Windows libdrm-compatible library has no syncobj or sync_file fds, so
+leave the opaque-fd and sync-file import/export hooks of the DRM syncobj
+sync type unset there. Otherwise the generic external semaphore/fence
+queries advertise OPAQUE_FD/SYNC_FD handle types (and WSI picks them up
+in semaphore_export_handle_types) although VK_KHR_external_*_fd isn't
+exposed and there is no way to get such an fd.
+
+The sync-file helpers stay: vk_drm_syncobj_move() still uses them for
+shared syncobjs.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_drm_syncobj.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/vulkan/runtime/vk_drm_syncobj.c b/src/vulkan/runtime/vk_drm_syncobj.c
+index 9da1cae..4d34cd6 100644
+--- a/src/vulkan/runtime/vk_drm_syncobj.c
++++ b/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -363,6 +363,7 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++#if !DETECT_OS_WINDOWS
+ static VkResult
+ vk_drm_syncobj_import_opaque_fd(struct vk_device *device,
+                                 struct vk_sync *sync,
+@@ -400,6 +401,7 @@ vk_drm_syncobj_export_opaque_fd(struct vk_device *device,
+ 
+    return VK_SUCCESS;
+ }
++#endif /* !DETECT_OS_WINDOWS */
+ 
+ static VkResult
+ vk_drm_syncobj_import_sync_file(struct vk_device *device,
+@@ -678,10 +680,15 @@ vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync)
+       .reset = vk_drm_syncobj_reset,
+       .reset_many = vk_drm_syncobj_reset_many,
+       .move = vk_drm_syncobj_move,
++#if !DETECT_OS_WINDOWS
++      /* A Windows libdrm-compatible library has no syncobj or sync_file fds,
++       * so don't advertise any external handle types there.
++       */
+       .import_opaque_fd = vk_drm_syncobj_import_opaque_fd,
+       .export_opaque_fd = vk_drm_syncobj_export_opaque_fd,
+       .import_sync_file = vk_drm_syncobj_import_sync_file,
+       .export_sync_file = vk_drm_syncobj_export_sync_file,
++#endif
+    };
+ 
+    err = sync->wait(sync, &syncobj, 1, 0,

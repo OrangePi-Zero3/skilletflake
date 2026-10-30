@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:32:57 +0000
+Subject: [PATCH 05/14] vulkan/wsi: keep the DRM WSI paths out of Windows
+ builds
+
+A Windows build may have a libdrm-compatible render-node library (panvk
+uses one to talk to its kernel driver), but there is no dma-buf or KMS.
+Add WSI_HAVE_DRM and use it instead of HAVE_LIBDRM for the dma-buf and
+explicit-sync image paths, and only build wsi_common_drm.c on systems
+with KMS/DRM.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/wsi/meson.build          |  2 +-
+ src/vulkan/wsi/wsi_common.c         | 20 ++++++++++----------
+ src/vulkan/wsi/wsi_common_private.h | 11 ++++++++++-
+ 3 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index bc23ebe..7039612 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -5,7 +5,7 @@ files_vulkan_wsi = files('wsi_common.c')
+ links_vulkan_wsi = []
+ platform_deps = []
+ 
+-if dep_libdrm.found()
++if dep_libdrm.found() and system_has_kms_drm
+   files_vulkan_wsi += files('wsi_common_drm.c')
+ endif
+ 
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index e7e077f..7652fa4 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -317,14 +317,14 @@ wsi_device_init(struct wsi_device *wsi,
+ 
+    /* can_present_on_device is a function pointer used to determine if images
+     * can be presented directly on a given device file descriptor (fd).
+-    * If HAVE_LIBDRM is defined, it will be initialized to a platform-specific
++    * If WSI_HAVE_DRM is set, it will be initialized to a platform-specific
+     * function (wsi_device_matches_drm_fd). Otherwise, it is initialized to
+     * present_false to ensure that it always returns false, preventing potential
+     * segmentation faults from unchecked calls.
+     * Drivers for non-PCI based GPUs are expected to override this after calling
+     * wsi_device_init().
+     */
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    wsi->can_present_on_device = wsi_device_matches_drm_fd;
+ #else
+    wsi->can_present_on_device = present_false;
+@@ -415,7 +415,7 @@ get_blit_type(const struct wsi_device *wsi,
+       return wsi_cpu_image_needs_buffer_blit(wsi, cpu_params) ?
+          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
+    }
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    case WSI_IMAGE_TYPE_DRM: {
+       const struct wsi_drm_image_params *drm_params =
+          container_of(params, const struct wsi_drm_image_params, base);
+@@ -465,7 +465,7 @@ configure_image(const struct wsi_swapchain *chain,
+          container_of(params, const struct wsi_cpu_image_params, base);
+       return wsi_configure_cpu_image(chain, pCreateInfo, cpu_params, info);
+    }
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    case WSI_IMAGE_TYPE_DRM: {
+       const struct wsi_drm_image_params *drm_params =
+          container_of(params, const struct wsi_drm_image_params, base);
+@@ -579,7 +579,7 @@ wsi_swapchain_init(const struct wsi_device *wsi,
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    result = wsi_drm_init_swapchain_implicit_sync(chain);
+    if (result != VK_SUCCESS)
+       goto fail;
+@@ -918,7 +918,7 @@ wsi_create_image(const struct wsi_swapchain *chain,
+    }
+ 
+    if (info->explicit_sync) {
+-#if HAVE_LIBDRM
++#if WSI_HAVE_DRM
+       result = wsi_create_image_explicit_sync_drm(chain, image);
+       if (result != VK_SUCCESS)
+          goto fail;
+@@ -1034,7 +1034,7 @@ wsi_destroy_image(const struct wsi_swapchain *chain,
+ #endif
+ 
+    if (image->explicit_sync[WSI_ES_ACQUIRE].semaphore) {
+-#if HAVE_LIBDRM
++#if WSI_HAVE_DRM
+       wsi_destroy_image_explicit_sync_drm(chain, image);
+ #endif
+    }
+@@ -2251,7 +2251,7 @@ wsi_signal_semaphore_for_image(struct vk_device *device,
+ 
+    vk_semaphore_reset_temporary(device, semaphore);
+ 
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    VkResult result = chain->image_info.explicit_sync ?
+       wsi_create_sync_for_image_syncobj(chain, image,
+                                         VK_SYNC_FEATURE_GPU_WAIT,
+@@ -2281,7 +2281,7 @@ wsi_signal_fence_for_image(struct vk_device *device,
+ 
+    vk_fence_reset_temporary(device, fence);
+ 
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+    VkResult result = chain->image_info.explicit_sync ?
+       wsi_create_sync_for_image_syncobj(chain, image,
+                                         VK_SYNC_FEATURE_CPU_WAIT,
+@@ -2901,7 +2901,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+        * implicitly syncs on it.
+        */
+       if (swapchain->dma_buf_semaphore != VK_NULL_HANDLE) {
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+          assert(!swapchain->image_info.explicit_sync);
+          results[i] = wsi_signal_dma_buf_from_semaphore(swapchain, image);
+          if (results[i] != VK_SUCCESS)
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 58b592a..f27466e 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -28,6 +28,15 @@
+ #include "vk_object.h"
+ #include "vk_sync.h"
+ 
++/* dma-buf/syncobj based WSI. Windows builds may have a libdrm-compatible
++ * render-node library, but no dma-buf or KMS.
++ */
++#if defined(HAVE_LIBDRM) && !defined(_WIN32)
++#define WSI_HAVE_DRM 1
++#else
++#define WSI_HAVE_DRM 0
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -472,7 +481,7 @@ wsi_swapchain_present_timing_update_refresh_rate(struct wsi_swapchain *chain,
+                                                  uint64_t refresh_duration, uint64_t refresh_interval,
+                                                  int minimum_delta_for_update);
+ 
+-#ifdef HAVE_LIBDRM
++#if WSI_HAVE_DRM
+ VkResult
+ wsi_prepare_signal_dma_buf_from_semaphore(struct wsi_swapchain *chain,
+                                           const struct wsi_image *image);

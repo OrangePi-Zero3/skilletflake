@@ -1,0 +1,110 @@
+--- a/wdm.h
++++ b/wdm.h
+@@ -8325,6 +8325,33 @@
+ KeRaiseIrqlToSynchLevel(VOID);
+ 
+ 
++#elif defined(__aarch64__) || defined(_M_ARM64)
++/** Kernel definitions for ARM64 (panfrost-win toolchain shim; NOT from the WDK).
++ *  The IRQL helpers below are declared as imports, but the real ARM64 WDK most likely inlines
++ *  them (PCR access through x18). Do NOT call them until they are checked against a real
++ *  ARM64 ntoskrnl.exe export table (toolchain/scripts/gen-defs.py --from-pe). */
++#define PASSIVE_LEVEL           0
++#define LOW_LEVEL               0
++#define APC_LEVEL               1
++#define DISPATCH_LEVEL          2
++#define CLOCK_LEVEL             13
++#define IPI_LEVEL               14
++#define DRS_LEVEL               14
++#define POWER_LEVEL             14
++#define PROFILE_LEVEL           15
++#define HIGH_LEVEL              15
++#define PAGE_SIZE               0x1000
++#define PAGE_SHIFT              12L
++typedef struct _KFLOATING_SAVE { ULONG Dummy; } KFLOATING_SAVE, *PKFLOATING_SAVE;
++#define YieldProcessor() __asm__ __volatile__("yield")
++NTKERNELAPI KIRQL NTAPI KeGetCurrentIrql(VOID);
++NTKERNELAPI VOID NTAPI KeLowerIrql(IN KIRQL NewIrql);
++NTKERNELAPI KIRQL NTAPI KfRaiseIrql(IN KIRQL NewIrql);
++#define KeRaiseIrql(a,b) *(b) = KfRaiseIrql(a)
++NTKERNELAPI KIRQL NTAPI KeRaiseIrqlToDpcLevel(VOID);
++NTKERNELAPI PKTHREAD NTAPI KeGetCurrentThread(VOID);
++#define KeFlushIoBuffers(_Mdl, _ReadOperation, _DmaOperation)
++#define DbgRaiseAssertionFailure() __builtin_trap()
+ #elif defined(_M_ARM)
+ #include <armddk.h>
+ #else
+@@ -11363,7 +11390,52 @@
+     } \
+ }
+ 
+-#if !defined(_M_AMD64)
++#if defined(__aarch64__) || defined(_M_ARM64)
++/*
++ * panfrost-win: ARM64 has no I/O ports and ntoskrnl does not export READ/WRITE_REGISTER_* on
++ * ARM64 (the WDK inlines them), so provide inline versions. Ordering follows Linux readl/writel:
++ * a write is preceded by "dmb oshst" (prior normal-memory writes, e.g. command buffers, are
++ * visible to the device first); a read is followed by "dmb oshld" (later normal-memory reads
++ * are not hoisted above it). Accesses are single aligned loads/stores, as Device memory needs.
++ */
++#define __PW_MMIO_RD(_n, _t, _insn, _reg) \
++FORCEINLINE _t READ_REGISTER_##_n(IN volatile _t *Register) \
++{ \
++  _t v; \
++  __asm__ __volatile__(_insn " %" _reg "0, [%1]" : "=r"(v) : "r"(Register) : "memory"); \
++  __asm__ __volatile__("dmb oshld" ::: "memory"); \
++  return v; \
++}
++#define __PW_MMIO_WR(_n, _t, _insn, _reg) \
++FORCEINLINE VOID WRITE_REGISTER_##_n(IN volatile _t *Register, IN _t Value) \
++{ \
++  __asm__ __volatile__("dmb oshst" ::: "memory"); \
++  __asm__ __volatile__(_insn " %" _reg "0, [%1]" : : "rZ"(Value), "r"(Register) : "memory"); \
++}
++__PW_MMIO_RD(UCHAR, UCHAR, "ldrb", "w")
++__PW_MMIO_RD(USHORT, USHORT, "ldrh", "w")
++__PW_MMIO_RD(ULONG, ULONG, "ldr", "w")
++__PW_MMIO_RD(ULONG64, ULONG64, "ldr", "x")
++__PW_MMIO_WR(UCHAR, UCHAR, "strb", "w")
++__PW_MMIO_WR(USHORT, USHORT, "strh", "w")
++__PW_MMIO_WR(ULONG, ULONG, "str", "w")
++__PW_MMIO_WR(ULONG64, ULONG64, "str", "x")
++#undef __PW_MMIO_RD
++#undef __PW_MMIO_WR
++#define __PW_MMIO_BUF(_n, _t) \
++FORCEINLINE VOID READ_REGISTER_BUFFER_##_n(IN volatile _t *Register, OUT _t *Buffer, IN ULONG Count) \
++{ \
++  while (Count--) *Buffer++ = READ_REGISTER_##_n(Register++); \
++} \
++FORCEINLINE VOID WRITE_REGISTER_BUFFER_##_n(IN volatile _t *Register, IN _t *Buffer, IN ULONG Count) \
++{ \
++  while (Count--) WRITE_REGISTER_##_n(Register++, *Buffer++); \
++}
++__PW_MMIO_BUF(UCHAR, UCHAR)
++__PW_MMIO_BUF(USHORT, USHORT)
++__PW_MMIO_BUF(ULONG, ULONG)
++#undef __PW_MMIO_BUF
++#elif !defined(_M_AMD64)
+ NTHALAPI
+ VOID
+ NTAPI
+--- a/ntddk.h
++++ b/ntddk.h
+@@ -3339,6 +3339,17 @@
+ 
+ #elif defined(_M_MIPS)
+ 
++#elif defined(__aarch64__) || defined(_M_ARM64)
++/* panfrost-win ARM64 shim (not from the WDK) */
++#define PAUSE_PROCESSOR YieldProcessor();
++#define KERNEL_STACK_SIZE 0x6000
++#define KERNEL_LARGE_STACK_SIZE 0x12000
++#define KERNEL_LARGE_STACK_COMMIT KERNEL_STACK_SIZE
++#define EXCEPTION_READ_FAULT    0
++#define EXCEPTION_WRITE_FAULT   1
++#define EXCEPTION_EXECUTE_FAULT 8
++#define MM_USER_PROBE_ADDRESS             MmUserProbeAddress
++#define MM_LOWEST_USER_ADDRESS   (PVOID)0x10000
+ #elif defined(_M_ARM)
+ #else
+ #error Unknown Architecture

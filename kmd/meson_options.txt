@@ -1,0 +1,6 @@
+option('core', type: 'combo', choices: ['real', 'stub'], value: 'stub',
+       description: 'real: link the OS-neutral Mali core from kmd/core (needs kmd/core/meson.build); stub: kmd/win/pw_core_stub.c (GPU_ID smoke test only)')
+option('debug_ioctls', type: 'boolean', value: false,
+       description: 'Enable PANWIN_IOCTL_DEBUG_REG_READ (raw GPU register reads from user mode; bring-up builds only)')
+option('host_tests', type: 'boolean', value: true,
+       description: 'Build host-native unit tests for OS-neutral glue helpers (needs a native C compiler)')

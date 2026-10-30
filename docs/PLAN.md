@@ -1,6 +1,6 @@
 # panfrost-win: an open Mali GPU driver for Windows on Arm
 
-Status: plan v1, 2026-10-30. Research behind every decision here is in [`docs/research/`](research/).
+Status: plan v1, 2026-10-30. M0 (hardware-free foundations) landed, see [`docs/status/`](status/). Research behind every decision here is in [`docs/research/`](research/).
 
 ## Goal
 
@@ -119,3 +119,16 @@ tools/                panwin-info and other bring-up tools
 4. **Memory types / non-coherent GPU** — CPU mappings of shared memory must be Normal-NC/WC, not
    Device; atomics on uncached memory may fault. Verify `MmNonCached` vs `MmWriteCombined` on HW.
 5. **panvk feature gaps** (GS/tess) cap GL and block DXVK — upstream work, outside our control.
+
+## Open contract decisions (from the M0 reviews)
+
+1. **IOCTL errors**: adopt `NTSTATUS = 0xE0000000 | (0xD52 << 16) | errno` for DRM ioctls, so the shim recovers
+   the exact Linux errno (today ETIME and ETIMEDOUT collapse into one status). Needs kmd/win + libdrm-win changes.
+2. **User MMIO offset**: Mesa on Windows computes `DRM_PANTHOR_USER_MMIO_OFFSET` as `1ull << 43` (`unsigned long`
+   is 32-bit on Windows). The kernel accepts that value and the 64-bit Linux one.
+3. **Syncobj timeouts** are absolute nanoseconds on the QueryPerformanceCounter clock (Mesa's `os_time` base on Windows).
+4. **pw_os.h clarifications**: events are manual-reset; `0xFFFFFFFF` is an infinite wait; only the reg/udelay/time
+   functions are ISR-safe; flush cleans to the PoC. Also add `timer_hz` to `pw_device_params` (today 24 MHz is hard-coded).
+5. **GPU `_DSM`** (edk2 patch): UUID `102bc718-f3be-4e3c-8e12-dc78892ef9a5`, functions 1 get / 2 set / 3 max / 4 diag;
+   any non-zero return from "set" is a failure. The driver checks `_PSC == 0` before touching registers.
+6. **Mesa AI policy**: see [`userspace/mesa/AI-POLICY.md`](../userspace/mesa/AI-POLICY.md). Owner decision pending.

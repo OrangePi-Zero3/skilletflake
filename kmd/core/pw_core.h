@@ -48,4 +48,30 @@ int  pw_device_get_csif_info(struct pw_device *dev, struct drm_panthor_csif_info
 /* Human-readable one-line state for debugging (e.g. "G610 r0p0 arch10.8, fw booted, 8 CSGs"). */
 void pw_device_describe(struct pw_device *dev, char *buf, size_t len);
 
+/* ---- additions (kmd-core, M1-M2) ---- */
+
+struct drm_panthor_mmu_info;
+
+/*
+ * Two-phase creation. pw_device_alloc() touches no hardware; it lets the OS layer publish the
+ * device pointer to its ISR before pw_device_probe() unmasks any GPU interrupt (pw_irq_top()
+ * returns false for a NULL device, which would leave a level-triggered line asserted).
+ * pw_device_create() == alloc + probe (+ destroy on failure). All waits in probe also poll the
+ * RAWSTAT registers, so probe completes (more slowly) even if interrupts are not delivered.
+ * After a failed probe the device must still be released with pw_device_destroy().
+ * Bottom halves of different lines must be able to run concurrently: the MMU bottom half can
+ * wait (up to 100 ms, then falls back to polling) for a GPU cache flush to complete.
+ */
+int  pw_device_alloc(const struct pw_device_params *params, struct pw_device **out);
+int  pw_device_probe(struct pw_device *dev);
+
+/* True once the MCU raised GLOBAL_IF and the interfaces were parsed (PANWIN_INFO_FW_BOOTED). */
+bool pw_device_fw_booted(struct pw_device *dev);
+
+/* Toggle GLB_PING and wait for the FW to ack it. PW_OK, PW_ETIMEDOUT, or PW_EINVAL if no FW. */
+int  pw_device_fw_ping(struct pw_device *dev, uint32_t timeout_ms);
+
+/* DRM_PANTHOR_DEV_QUERY_MMU_INFO payload. */
+void pw_device_get_mmu_info(struct pw_device *dev, struct drm_panthor_mmu_info *info);
+
 #endif /* PW_CORE_H */

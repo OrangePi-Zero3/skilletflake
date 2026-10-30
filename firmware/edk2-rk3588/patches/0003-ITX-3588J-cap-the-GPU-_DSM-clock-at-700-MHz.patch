@@ -1,0 +1,35 @@
+From 4f9f268e1d20e0066f16621db75d762b57963fca Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:19:41 +0000
+Subject: [PATCH 3/3] ITX-3588J: cap the GPU _DSM clock at 700 MHz
+
+The Firefly ITX-3588J uses the industrial RK3588J, whose GPU OPP table
+(Linux rk3588j.dtsi) stops at 700 MHz even at 750 mV. The common
+800 MHz default from Gpu.asl would let a driver request an out-of-spec
+rate through _DSM function 2.
+
+Untested on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ edk2-rockchip/Platform/Firefly/ITX-3588J/AcpiTables/Dsdt.asl | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/edk2-rockchip/Platform/Firefly/ITX-3588J/AcpiTables/Dsdt.asl b/edk2-rockchip/Platform/Firefly/ITX-3588J/AcpiTables/Dsdt.asl
+index 0fa03f6..6815b03 100644
+--- a/edk2-rockchip/Platform/Firefly/ITX-3588J/AcpiTables/Dsdt.asl
++++ b/edk2-rockchip/Platform/Firefly/ITX-3588J/AcpiTables/Dsdt.asl
+@@ -13,6 +13,10 @@
+ 
+ #include "AcpiTables.h"
+ 
++// RK3588J: the industrial SoC bin is limited to 700 MHz GPU (Linux
++// rk3588j.dtsi gpu_opp_table), even at 750 mV.
++#define BOARD_GPU_MAX_FREQ_HZ 700000000
++
+ DefinitionBlock ("Dsdt.aml", "DSDT", 2, "RKCP  ", "RK3588  ", 2)
+ {
+   Scope (\_SB_)
+-- 
+2.56.0
+

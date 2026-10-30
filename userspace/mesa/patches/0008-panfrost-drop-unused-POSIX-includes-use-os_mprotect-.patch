@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:32:57 +0000
+Subject: [PATCH 08/14] panfrost: drop unused POSIX includes, use os_mprotect()
+ in pandecode
+
+midgard_compile.c and decode.c include <err.h>/<sys/mman.h> and friends
+without using them, and pandecode's mprotect() calls can go through
+util/os_mman.h, which also works on Windows.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/compiler/midgard/midgard_compile.c | 5 -----
+ src/panfrost/genxml/decode.c                    | 1 -
+ src/panfrost/genxml/decode_common.c             | 6 +++---
+ 3 files changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/src/panfrost/compiler/midgard/midgard_compile.c b/src/panfrost/compiler/midgard/midgard_compile.c
+index ca695dc..05b1933 100644
+--- a/src/panfrost/compiler/midgard/midgard_compile.c
++++ b/src/panfrost/compiler/midgard/midgard_compile.c
+@@ -4,14 +4,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
+-#include <err.h>
+-#include <fcntl.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+-#include <sys/mman.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+ 
+ #include "compiler/glsl/glsl_to_nir.h"
+ #include "compiler/glsl_types.h"
+diff --git a/src/panfrost/genxml/decode.c b/src/panfrost/genxml/decode.c
+index 0d3357f..e7c8db8 100644
+--- a/src/panfrost/genxml/decode.c
++++ b/src/panfrost/genxml/decode.c
+@@ -14,7 +14,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <genxml/gen_macros.h>
+-#include <sys/mman.h>
+ 
+ #include "util/set.h"
+ #include "pan_format.h"
+diff --git a/src/panfrost/genxml/decode_common.c b/src/panfrost/genxml/decode_common.c
+index 96ee55b..ff26a99 100644
+--- a/src/panfrost/genxml/decode_common.c
++++ b/src/panfrost/genxml/decode_common.c
+@@ -10,11 +10,11 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/mman.h>
+ 
+ #include "lib/pan_props.h"
+ #include "util/log.h"
+ #include "util/macros.h"
++#include "util/os_mman.h"
+ #include "util/u_debug.h"
+ #include "util/u_hexdump.h"
+ #include "util/u_process.h"
+@@ -74,7 +74,7 @@ pandecode_find_mapped_gpu_mem_containing(struct pandecode_context *ctx,
+       pandecode_find_mapped_gpu_mem_containing_rw(ctx, addr);
+ 
+    if (mem && mem->addr && !mem->ro) {
+-      mprotect(mem->addr, mem->length, PROT_READ);
++      os_mprotect(mem->addr, mem->length, PROT_READ);
+       mem->ro = true;
+       util_dynarray_append(&ctx->ro_mappings, mem);
+    }
+@@ -129,7 +129,7 @@ pandecode_map_read_write(struct pandecode_context *ctx)
+    util_dynarray_foreach(&ctx->ro_mappings, struct pandecode_mapped_memory *,
+                          mem) {
+       (*mem)->ro = false;
+-      mprotect((*mem)->addr, (*mem)->length, PROT_READ | PROT_WRITE);
++      os_mprotect((*mem)->addr, (*mem)->length, PROT_READ | PROT_WRITE);
+    }
+    util_dynarray_clear(&ctx->ro_mappings);
+ }

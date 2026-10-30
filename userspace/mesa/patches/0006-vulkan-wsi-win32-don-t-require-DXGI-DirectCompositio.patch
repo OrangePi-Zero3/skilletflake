@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:32:57 +0000
+Subject: [PATCH 06/14] vulkan/wsi/win32: don't require DXGI/DirectComposition
+ for HW drivers
+
+Only drivers providing get_d3d12_command_queue (dozen) can use DXGI
+swapchains; everything else presents through the CPU image path, which
+only needs GDI. Don't fail wsi_device_init() for non-sw devices when the
+DXGI factory or the DComp device can't be created (no WDDM display stack,
+wine), just leave the DXGI path disabled.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/wsi/wsi_common_win32.cpp | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 0622857..96aefff 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1110,18 +1110,16 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
+    wsi->wsi = wsi_device;
+ 
+    if (!wsi_device->sw) {
++      /* DXGI swapchains are optional: without DXGI or DirectComposition
++       * (e.g. no WDDM display stack, or wine), non-sw devices fall back to
++       * the CPU image path, which only needs GDI.
++       */
+       wsi->dxgi.factory = dxgi_get_factory(WSI_DEBUG & WSI_DEBUG_DXGI);
+-      if (!wsi->dxgi.factory) {
+-         vk_free(alloc, wsi);
+-         result = VK_ERROR_INITIALIZATION_FAILED;
+-         goto fail;
+-      }
+-      wsi->dxgi.dcomp = dcomp_get_device();
+-      if (!wsi->dxgi.dcomp) {
++      if (wsi->dxgi.factory)
++         wsi->dxgi.dcomp = dcomp_get_device();
++      if (wsi->dxgi.factory && !wsi->dxgi.dcomp) {
+          wsi->dxgi.factory->Release();
+-         vk_free(alloc, wsi);
+-         result = VK_ERROR_INITIALIZATION_FAILED;
+-         goto fail;
++         wsi->dxgi.factory = NULL;
+       }
+    }
+ 

@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: MIT
+option('fake_kernel', type : 'boolean', value : false,
+       description : 'Build the in-process fake panwin.sys transport (tests / no-hardware runs; enable at runtime with PANWIN_FAKE_KERNEL=1)')

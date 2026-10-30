@@ -1,0 +1,13 @@
+; WDFLDR.SYS exports used by KMDF client stubs. Names from Microsoft's MIT fxldr.h
+; (Windows-Driver-Frameworks src/framework/shared/inc/private/common/fxldr.h) and
+; cross-checked against ReactOS wdfldr.spec. Not generated from a real ARM64 WDFLDR.SYS:
+; regenerate with `petool.py defs-from-pe --pe WDFLDR.SYS` (see toolchain/README.md).
+LIBRARY "WDFLDR.SYS"
+EXPORTS
+WdfLdrQueryInterface
+WdfRegisterClassLibrary
+WdfRegisterLibrary
+WdfVersionBind
+WdfVersionBindClass
+WdfVersionUnbind
+WdfVersionUnbindClass

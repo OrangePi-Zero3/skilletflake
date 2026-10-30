@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ExposureMG <exposuremg@protonmail.com>
+Date: Fri, 30 Oct 2026 01:32:57 +0000
+Subject: [PATCH 12/14] panvk: add Windows support
+
+- Expose VK_KHR_win32_surface. Presentation uses the existing win32 WSI
+  CPU path (GPU blit to a host-visible buffer, then a GDI blit).
+- Get the device numbers of the synthetic render node from libdrm-win
+  (they key the shared memory budget), and don't expose
+  VK_EXT_physical_device_drm.
+- Don't expose the fd/dma-buf external memory, semaphore and fence
+  extensions, nor VK_EXT_map_memory_placed: there are no such fds, and the
+  kernel driver creates CPU mappings itself.
+- Build vulkan_panfrost.dll with the vk_icd* exports from vulkan_api.def
+  and a backslash ICD manifest, like lavapipe.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/meson.build               | 23 +++++++++++-------
+ src/panfrost/vulkan/panvk_instance.c          |  3 +++
+ src/panfrost/vulkan/panvk_instance.h          |  3 ++-
+ src/panfrost/vulkan/panvk_physical_device.c   | 24 +++++++++++++++++++
+ .../vulkan/panvk_vX_physical_device.c         | 22 ++++++++++-------
+ 5 files changed, 58 insertions(+), 17 deletions(-)
+
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 7c87fe4..e9e4209 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -237,6 +237,8 @@ libvulkan_panfrost = shared_library(
+   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
+   link_depends: vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',
++  vs_module_defs : vulkan_api_def,
++  name_prefix : host_machine.system() == 'windows' ? '' : [],
+   install : true,
+ )
+ 
+@@ -256,18 +258,23 @@ endif
+ 
+ icd_file_name = libname_prefix + 'vulkan_panfrost.' + libname_suffix
+ 
++icd_command = [
++  prog_python, '@INPUT0@',
++  '--api-version', '1.4', '--xml', '@INPUT1@',
++  '--sizeof-pointer', sizeof_pointer,
++  '--icd-lib-path', vulkan_icd_lib_path,
++  '--icd-filename', icd_file_name,
++  '--out', '@OUTPUT@',
++]
++if host_machine.system() == 'windows'
++  icd_command += '--use-backslash'
++endif
++
+ panfrost_icd = custom_target(
+   'panfrost_icd',
+   input : [vk_icd_gen, vk_api_xml],
+   output : 'panfrost_icd.' + vulkan_manifest_suffix,
+-  command : [
+-    prog_python, '@INPUT0@',
+-    '--api-version', '1.4', '--xml', '@INPUT1@',
+-    '--sizeof-pointer', sizeof_pointer,
+-    '--icd-lib-path', vulkan_icd_lib_path,
+-    '--icd-filename', icd_file_name,
+-    '--out', '@OUTPUT@',
+-  ],
++  command : icd_command,
+   build_by_default : true,
+   install_dir : with_vulkan_icd_dir,
+   install_tag : 'runtime',
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index c261536..9c7d612 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -117,6 +117,9 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
+ #ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    .KHR_wayland_surface = true,
+ #endif
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++   .KHR_win32_surface = true,
++#endif
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+    .KHR_xcb_surface = true,
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_instance.h b/src/panfrost/vulkan/panvk_instance.h
+index 4b9a528..2c23ca5 100644
+--- a/src/panfrost/vulkan/panvk_instance.h
++++ b/src/panfrost/vulkan/panvk_instance.h
+@@ -42,7 +42,8 @@ extern uint64_t panvk_debug;
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
+     defined(VK_USE_PLATFORM_XCB_KHR) || \
+     defined(VK_USE_PLATFORM_XLIB_KHR) || \
+-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
++    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
++    defined(VK_USE_PLATFORM_WIN32_KHR)
+ #define PANVK_USE_WSI_PLATFORM
+ #endif
+ 
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index c77286d..dd200b7 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -105,6 +105,29 @@ create_kmod_dev(struct panvk_physical_device *device,
+    return VK_SUCCESS;
+ }
+ 
++#if DETECT_OS_WINDOWS
++/* The device nodes are synthesized by libdrm-win. */
++static VkResult
++get_drm_device_ids(struct panvk_physical_device *device,
++                   const struct panvk_instance *instance,
++                   drmDevicePtr drm_device)
++{
++   uint64_t rdev;
++
++   if (panwin_stat_rdev(drm_device->nodes[DRM_NODE_RENDER], &rdev)) {
++      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
++                       "failed to query render node stat");
++   }
++
++   device->drm.render_rdev = rdev;
++
++   if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++       !panwin_stat_rdev(drm_device->nodes[DRM_NODE_PRIMARY], &rdev))
++      device->drm.primary_rdev = rdev;
++
++   return VK_SUCCESS;
++}
++#else
+ static VkResult
+ get_drm_device_ids(struct panvk_physical_device *device,
+                    const struct panvk_instance *instance,
+@@ -130,6 +153,7 @@ get_drm_device_ids(struct panvk_physical_device *device,
+ 
+    return VK_SUCCESS;
+ }
++#endif
+ 
+ static void
+ init_shader_caches(struct panvk_physical_device *device,
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 1dc3175..fc74191 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -9,7 +9,11 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/detect_os.h"
++
++#if !DETECT_OS_WINDOWS
+ #include <sys/sysmacros.h>
++#endif
+ 
+ #include "git_sha1.h"
+ 
+@@ -65,11 +69,11 @@ panvk_per_arch(get_physical_device_extensions)(
+       .KHR_dynamic_rendering_local_read = true,
+       .KHR_extended_flags = true,
+       .KHR_external_fence = true,
+-      .KHR_external_fence_fd = true,
++      .KHR_external_fence_fd = !DETECT_OS_WINDOWS,
+       .KHR_external_memory = true,
+-      .KHR_external_memory_fd = true,
++      .KHR_external_memory_fd = !DETECT_OS_WINDOWS,
+       .KHR_external_semaphore = true,
+-      .KHR_external_semaphore_fd = true,
++      .KHR_external_semaphore_fd = !DETECT_OS_WINDOWS,
+       .KHR_format_feature_flags2 = true,
+       .KHR_get_memory_requirements2 = true,
+       .KHR_global_priority = true,
+@@ -168,7 +172,7 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_acquire_unmodified = true,
+-      .EXT_external_memory_dma_buf = true,
++      .EXT_external_memory_dma_buf = !DETECT_OS_WINDOWS,
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = true,
+@@ -186,13 +190,13 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_legacy_dithering = true,
+       .EXT_line_rasterization = true,
+       .EXT_load_store_op_none = true,
+-      .EXT_map_memory_placed = true,
++      .EXT_map_memory_placed = !DETECT_OS_WINDOWS,
+       .EXT_nested_command_buffer = PAN_ARCH >= 10,
+       .EXT_memory_budget = true,
+       .EXT_non_seamless_cube_map = true,
+       .EXT_mutable_descriptor_type = PAN_ARCH >= 9,
+       .EXT_multisampled_render_to_single_sampled = true,
+-      .EXT_physical_device_drm = true,
++      .EXT_physical_device_drm = !DETECT_OS_WINDOWS,
+       .EXT_pipeline_creation_cache_control = true,
+       .EXT_pipeline_creation_feedback = true,
+       .EXT_pipeline_robustness = true,
+@@ -724,9 +728,9 @@ panvk_per_arch(get_physical_device_features)(
+       .nestedCommandBufferSimultaneousUse = PAN_ARCH >= 10,
+ 
+       /* VK_EXT_map_memory_placed */
+-      .memoryMapPlaced = true,
++      .memoryMapPlaced = !DETECT_OS_WINDOWS,
+       .memoryMapRangePlaced = false,
+-      .memoryUnmapReserve = true,
++      .memoryUnmapReserve = !DETECT_OS_WINDOWS,
+ 
+       /* VK_EXT_non_seamless_cube_map */
+       .nonSeamlessCubeMap = true,
+@@ -1377,6 +1381,7 @@ panvk_per_arch(get_physical_device_properties)(
+             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+ 
+    /* VK_EXT_physical_device_drm */
++#if !DETECT_OS_WINDOWS
+    if (device->drm.primary_rdev) {
+       properties->drmHasPrimary = true;
+       properties->drmPrimaryMajor = major(device->drm.primary_rdev);
+@@ -1387,6 +1392,7 @@ panvk_per_arch(get_physical_device_properties)(
+       properties->drmRenderMajor = major(device->drm.render_rdev);
+       properties->drmRenderMinor = minor(device->drm.render_rdev);
+    }
++#endif
+ 
+    /* VK_EXT_shader_module_identifier */
+    STATIC_ASSERT(sizeof(vk_shaderModuleIdentifierAlgorithmUUID) ==
