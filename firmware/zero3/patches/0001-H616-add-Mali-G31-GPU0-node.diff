@@ -1,0 +1,80 @@
+--- a/SoCs/Allwinner/H616/DSDT_minimal.dsl
++++ b/SoCs/Allwinner/H616/DSDT_minimal.dsl
+@@ -90,6 +90,77 @@
+             })
+         }
+ 
++        // Mali-G31 MP2 (Bifrost, job manager) - panwin.sys. Same block as Linux sun50i-h616.dtsi
++        // gpu@1800000: SPI 95/96/97 (job, mmu, gpu) = GSIV 127/128/129, in that order.
++        // vdd-gpu-sys (AXP313 DCDC1) is already on: PmicDxe enables it for HDMI.
++        // _PS0 powers the PPU domain, runs the core at 400 MHz (gpu0 <- gpu1 = periph0-2x / 3,
++        // as Linux sets up at boot; no GPU PLL or DVFS yet), opens the bus gate, then releases
++        // reset. The driver checks _PSC == 0 before touching any GPU register.
++        Device (GPU0)
++        {
++            Name (_HID, "AWGP0031")
++            Name (_UID, 0x00)
++            Name (_CCA, Zero)
++            Method (_STA, 0, NotSerialized)
++            {
++                Return (0x0F)
++            }
++            Name (_CRS, ResourceTemplate ()
++            {
++                Memory32Fixed (ReadWrite, 0x01800000, 0x00040000)
++                Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 127 }
++                Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 128 }
++                Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 129 }
++            })
++
++            // CCU (0x03001000): GPU0_CLK 0x670, GPU_CLK1 0x674, GPU_BGR 0x67C
++            OperationRegion (GCCU, SystemMemory, 0x03001670, 0x10)
++            Field (GCCU, DWordAcc, NoLock, Preserve)
++            {
++                GCK0, 32,
++                GCK1, 32,
++                Offset (0x0C),
++                GBGR, 32
++            }
++            // PRCM PPU GPU gate (0x07010254 bit 0), inverted: 1 = powered off
++            OperationRegion (GPPU, SystemMemory, 0x07010254, 0x04)
++            Field (GPPU, DWordAcc, NoLock, Preserve)
++            {
++                PGAT, 32
++            }
++
++            Method (_PSC, 0, Serialized)
++            {
++                If (((PGAT & One) == Zero) && ((GBGR & 0x00010001) == 0x00010001))
++                {
++                    Return (Zero)
++                }
++                Return (0x03)
++            }
++
++            Method (_PS0, 0, Serialized)
++            {
++                PGAT &= ~One
++                Sleep (One)
++                // gpu1: M = 2 (/3) -> 400 MHz, gate on (Linux keeps it on: CLK_IS_CRITICAL)
++                GCK1 = ((GCK1 & ~0x03) | 0x80000002)
++                // gpu0: parent gpu1 (bit 24), M = 0, gate on
++                GCK0 = ((GCK0 & ~0x01000003) | 0x81000000)
++                GBGR |= One
++                Stall (10)
++                GBGR |= 0x00010000
++                Stall (10)
++            }
++
++            Method (_PS3, 0, Serialized)
++            {
++                GBGR &= ~0x00010000
++                GBGR &= ~One
++                GCK0 &= ~0x80000000
++                PGAT |= One
++            }
++        }
++
+         // never got to bring this up lmao
+         Device (SDC0)
+         {

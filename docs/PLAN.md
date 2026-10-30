@@ -1,6 +1,6 @@
 # panfrost-win: an open Mali GPU driver for Windows on Arm
 
-Status: plan v1, 2026-10-30. M0 (hardware-free foundations) landed, see [`docs/status/`](status/). Research behind every decision here is in [`docs/research/`](research/).
+Status: plan v2, 2026-10-30. M0 and the hardware-free M3–M5 work landed, see [`docs/status/`](status/). The first board is now an Orange Pi Zero3 (Mali-G31, D6); the G610 work below is parked until an RK3588 board is available. Research behind every decision here is in [`docs/research/`](research/).
 
 ## Goal
 
@@ -72,9 +72,39 @@ Why this shape:
 | WDDM 2.x (phase 2) | proper adapter, D3DKMT path, DXGI flip present, system GL ICD, D3D via a Gallium UMD |
 | DXVK / vkd3d-proton | blocked on panvk geometry + tessellation shaders (upstream work in progress) |
 
+### D6. First hardware target: Orange Pi Zero3 / Mali-G31 MP2 (Bifrost v7, job manager)
+
+Decided 2026-10-30: the board actually available is halal-beef's Orange Pi Zero3 (Allwinner H618,
+1.5 GB), which already runs Windows 11 ARM64 (≤ 23H2) on his Mu-Silicium UEFI with an SD-card
+driver. Hardware we can test on beats a better-supported GPU we can't, so the G31 comes first.
+Facts and sources: [`research/zero3-g31.md`](research/zero3-g31.md).
+
+- **Kernel:** a second backend in `kmd/core` for the job manager, speaking the Linux panfrost
+  uAPI (MIT header; the GPL-2.0-only Linux driver is a behaviour reference only). Shared with the
+  CSF backend: `pw_os.h`, fences/syncobjs, handle tables, MMU page tables, file/ioctl dispatch,
+  the Windows glue and libdrm-win. The CSF backend (D1) stays and is selected by GPU_ID.
+- **Firmware:** a `GPU0` node (`AWGP0031`) for Silicium-ACPI's H616 DSDT whose `_PS0` powers the
+  GPU domain and clocks it at 400 MHz (`firmware/zero3/`), offered to halal-beef as a patch.
+- **Userspace:** panvk v7 with `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1` (non-conformant on Bifrost);
+  Gallium panfrost GL through WGL later.
+
 ## Milestones
 
-Hardware-free work (M0) can be verified here; everything from M1 needs an RK3588 board with UART.
+Hardware-free work can be verified here; everything else needs the board and a UART.
+
+Zero3 / G31 track (current):
+
+- **Z0 — hardware-free.** JM backend + panfrost uAPI in `kmd/core`, a mock G31 that executes job
+  chains, panvk v7 under wine on the real core (like `tests/e2e`); `GPU0` ACPI node (done, AML
+  tested).
+- **Z1 — GPU alive.** Zero3 firmware with `GPU0`; panwin.sys loads (test-signed), `_PSC` 0,
+  GPU_ID reads as G31, soft reset, IRQs fire. `panwin-info` prints GET_PARAM values.
+- **Z2 — first job.** Kernel-written WRITE_VALUE job on JS1, done IRQ, syncobj signalled.
+- **Z3 — panvk.** vulkaninfo and a compute sample on the board.
+- **Z4 — rendering.** vkcube via win32 WSI (CPU blit); then Gallium GL via WGL.
+
+G610 / CSF track (parked; M3–M5 kernel code exists and passes on the mock):
+
 
 - **M0 — foundations (no hardware).** Toolchain, repo, KMDF skeleton that loads ACPI resources,
   OS-neutral core with host unit tests against a mock register file + the real firmware binary,
